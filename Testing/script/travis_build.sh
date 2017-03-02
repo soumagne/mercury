@@ -54,5 +54,5 @@ fi
 cd $HOME && wget http://cci-forum.com/wp-content/uploads/2016/06/cci-${CCI_VERSION}.tar.gz
 tar -xzf cci-${CCI_VERSION}.tar.gz && cd cci-${CCI_VERSION};
 patch -p1 < ${TRAVIS_BUILD_DIR}/Testing/script/cci_20170301.patch
-./configure --prefix=$HOME/install && make -j2 -s && make install;
+autoreconf --force --install && ./configure --prefix=$HOME/install && make -j2 -s && make install;
 
