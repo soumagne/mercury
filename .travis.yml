@@ -44,8 +44,7 @@ matrix:
 branches:
   only:
     - master
-    - topic_travis
-    - travis_cron
+    - topic_cci_tcp
 
 before_install:
     - echo "Existing directories in $HOME" && ls $HOME
