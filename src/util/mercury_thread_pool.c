@@ -11,15 +11,19 @@
 #include "mercury_thread_pool.h"
 #include "mercury_thread_condition.h"
 #include "mercury_util_error.h"
+#include "mercury_atomic.h"
+#include "mercury_atomic_queue.h"
 
 #include <stdlib.h>
 
+#define HG_THREAD_POOL_QUEUE_SIZE 1024
+
 struct hg_thread_pool {
-    unsigned int sleeping_worker_count;
+    hg_atomic_int32_t sleeping_worker_count;
     unsigned int thread_count;
     hg_thread_t *threads;
-    HG_QUEUE_HEAD(hg_thread_work) queue;
-    int shutdown;
+    struct hg_atomic_queue *queue;
+    hg_atomic_int32_t shutdown;
     hg_thread_mutex_t mutex;
     hg_thread_cond_t cond;
 };
@@ -38,32 +42,34 @@ hg_thread_pool_worker(void *args)
         hg_thread_mutex_lock(&pool->mutex);
 
         /* If not shutting down and nothing to do, worker sleeps */
-        while (!pool->shutdown && HG_QUEUE_IS_EMPTY(&pool->queue)) {
-            pool->sleeping_worker_count++;
+        while (hg_atomic_queue_is_empty(pool->queue) && !hg_atomic_get32(&pool->shutdown)) {
+            hg_atomic_incr32(&pool->sleeping_worker_count);
             if (hg_thread_cond_wait(&pool->cond, &pool->mutex) != HG_UTIL_SUCCESS) {
                 HG_UTIL_LOG_ERROR("Thread cannot wait on condition variable");
-                goto unlock;
+                hg_thread_mutex_unlock(&pool->mutex);
+                goto done;
             }
-            pool->sleeping_worker_count--;
+            hg_atomic_decr32(&pool->sleeping_worker_count);
         }
+        /* Unlock */
+        hg_thread_mutex_unlock(&pool->mutex);
 
-        if (pool->shutdown && HG_QUEUE_IS_EMPTY(&pool->queue)) {
-            goto unlock;
+        if (hg_atomic_get32(&pool->shutdown)
+            && hg_atomic_queue_is_empty(pool->queue)) {
+            goto done;
         }
 
         /* Grab our task */
-        work = HG_QUEUE_FIRST(&pool->queue);
-        HG_QUEUE_POP_HEAD(&pool->queue, entry);
-
-        /* Unlock */
-        hg_thread_mutex_unlock(&pool->mutex);
+        work = hg_atomic_queue_pop_mc(pool->queue);
+        if (!work) {
+            continue;
+        }
 
         /* Get to work */
         (*work->func)(work->args);
     }
 
-unlock:
-    hg_thread_mutex_unlock(&pool->mutex);
+done:
     hg_thread_exit(ret);
     return ret;
 }
@@ -88,11 +94,11 @@ hg_thread_pool_init(unsigned int thread_count, hg_thread_pool_t **pool)
         ret = HG_UTIL_FAIL;
         goto done;
     }
-    priv_pool->sleeping_worker_count = 0;
+    hg_atomic_init32(&priv_pool->sleeping_worker_count, 0);
     priv_pool->thread_count = thread_count;
     priv_pool->threads = NULL;
-    HG_QUEUE_INIT(&priv_pool->queue);
-    priv_pool->shutdown = 0;
+    priv_pool->queue = hg_atomic_queue_alloc(HG_THREAD_POOL_QUEUE_SIZE);
+    hg_atomic_init32(&priv_pool->shutdown, 0);
 
     if (hg_thread_mutex_init(&priv_pool->mutex) != HG_UTIL_SUCCESS) {
         HG_UTIL_LOG_ERROR("Could not initialize mutex");
@@ -144,15 +150,13 @@ hg_thread_pool_destroy(hg_thread_pool_t *pool)
     if (!pool) goto done;
 
     if (pool->threads) {
+        hg_atomic_set32(&pool->shutdown, 1);
+
         hg_thread_mutex_lock(&pool->mutex);
-
-        pool->shutdown = 1;
-
         if (hg_thread_cond_broadcast(&pool->cond) != HG_UTIL_SUCCESS) {
             HG_UTIL_LOG_ERROR("Could not broadcast condition signal");
             ret = HG_UTIL_FAIL;
         }
-
         hg_thread_mutex_unlock(&pool->mutex);
 
         if (ret != HG_UTIL_SUCCESS) goto done;
@@ -166,6 +170,7 @@ hg_thread_pool_destroy(hg_thread_pool_t *pool)
         }
     }
 
+    hg_atomic_queue_free(pool->queue);
     free(pool->threads);
     pool->threads = NULL;
 
@@ -210,28 +215,25 @@ hg_thread_pool_post(hg_thread_pool_t *pool, struct hg_thread_work *work)
         goto done;
     }
 
-    hg_thread_mutex_lock(&pool->mutex);
-
     /* Are we shutting down ? */
-    if (pool->shutdown) {
+    if (hg_atomic_get32(&pool->shutdown)) {
         HG_UTIL_LOG_ERROR("Pool is shutting down");
         ret = HG_UTIL_FAIL;
-        goto unlock;
+        goto done;
     }
 
     /* Add task to task queue */
-    HG_QUEUE_PUSH_TAIL(&pool->queue, work, entry);
+    hg_atomic_queue_push(pool->queue, work);
 
     /* Wake up sleeping worker */
-    if (pool->sleeping_worker_count) {
+    if (hg_atomic_get32(&pool->sleeping_worker_count)) {
+        hg_thread_mutex_lock(&pool->mutex);
         if (hg_thread_cond_signal(&pool->cond) != HG_UTIL_SUCCESS) {
             HG_UTIL_LOG_ERROR("Cannot signal pool condition");
             ret = HG_UTIL_FAIL;
         }
+        hg_thread_mutex_unlock(&pool->mutex);
     }
-
-unlock:
-    hg_thread_mutex_unlock(&pool->mutex);
 
 done:
     return ret;
