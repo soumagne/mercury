@@ -47,7 +47,6 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        build_type: [Debug, RelWithDebInfo, Release]
         config:
           - {
               name: "Linux GCC",
@@ -67,7 +66,9 @@ jobs:
               cc: clang,
               cxx: clang++
             }
-        # libs: [shared]
+        build_type: [Debug, RelWithDebInfo, Release]
+        libs: [shared]
+
         # include:
         #   - config: "Linux GCC"
         #     build_type: Debug
