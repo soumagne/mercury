@@ -53,22 +53,19 @@ jobs:
               name: "Linux GCC",
               os: ubuntu-latest,
               cc: gcc,
-              cxx: g++,
-              build_type: ${{ matrix.build_type }}
+              cxx: g++
             }
           - {
               name: "Linux Clang",
               os: ubuntu-latest,
               cc: clang,
-              cxx: clang++,
-              build_type: ${{ matrix.build_type }}
+              cxx: clang++
           }
           - {
               name: "macOS Clang",
               os: macos-latest,
               cc: clang,
-              cxx: clang++,
-              build_type: ${{ matrix.build_type }}
+              cxx: clang++
             }
         # libs: [shared]
         # include:
