@@ -52,21 +52,23 @@ jobs:
               name: "Linux GCC",
               os: ubuntu-latest,
               cc: gcc,
-              cxx: g++
+              cxx: g++,
+              build_type: [Debug, RelWithDebInfo, Release]
             }
           - {
               name: "Linux Clang",
               os: ubuntu-latest,
               cc: clang,
-              cxx: clang++
+              cxx: clang++,
+              build_type: [Debug, RelWithDebInfo, Release]
           }
           - {
               name: "macOS Clang",
               os: macos-latest,
               cc: clang,
-              cxx: clang++
+              cxx: clang++,
+              build_type: [Debug, RelWithDebInfo, Release]
             }
-        # build_type: [Debug, RelWithDebInfo, Release]
         # libs: [shared]
         # include:
         #   - config: "Linux GCC"
