@@ -48,18 +48,24 @@ jobs:
       fail-fast: false
       matrix:
         config:
-          - name: "Linux GCC"
-            os: ubuntu-latest
-            cc: gcc
-            cxx: g++
-          - name: "Linux Clang"
-            os: ubuntu-latest
-            cc: clang
-            cxx: clang++
-          - name: "macOS Clang"
-            os: macos-latest
-            cc: clang
-            cxx: clang++
+          - {
+              name: "Linux GCC",
+              os: ubuntu-latest,
+              cc: gcc,
+              cxx: g++
+            }
+          - {
+              name: "Linux Clang",
+              os: ubuntu-latest,
+              cc: clang,
+              cxx: clang++
+          }
+          - {
+              name: "macOS Clang",
+              os: macos-latest,
+              cc: clang,
+              cxx: clang++
+            }
         build_type: [Debug, RelWithDebInfo, Release]
         libs: [shared]
         include:
