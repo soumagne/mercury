@@ -47,27 +47,28 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        build_type: [Debug, RelWithDebInfo, Release]
         config:
           - {
               name: "Linux GCC",
               os: ubuntu-latest,
               cc: gcc,
               cxx: g++,
-              build_type: [Debug, RelWithDebInfo, Release]
+              build_type: ${{ matrix.build_type }}
             }
           - {
               name: "Linux Clang",
               os: ubuntu-latest,
               cc: clang,
               cxx: clang++,
-              build_type: [Debug, RelWithDebInfo, Release]
+              build_type: ${{ matrix.build_type }}
           }
           - {
               name: "macOS Clang",
               os: macos-latest,
               cc: clang,
               cxx: clang++,
-              build_type: [Debug, RelWithDebInfo, Release]
+              build_type: ${{ matrix.build_type }}
             }
         # libs: [shared]
         # include:
