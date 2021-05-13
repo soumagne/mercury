@@ -66,8 +66,7 @@ jobs:
         build_type: [Debug, RelWithDebInfo, Release, Asan, Tsan, Ubsan]
         libs: [static, shared]
         exclude:
-          - build_type: [RelWithDebInfo, Release, Asan, Tsan, Ubsan]
-            libs: static
+          - os: macos-latest
         #   - config: "Linux GCC"
         #     build_type: Asan
         #     libs: shared
