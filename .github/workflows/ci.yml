@@ -65,10 +65,9 @@ jobs:
             }
         build_type: [Debug, RelWithDebInfo, Release, Asan, Tsan, Ubsan]
         libs: [static, shared]
-        # exclude:
-        #   - config.os: ubuntu-latest
-        #     build_type: Debug
-        #     libs: static
+        exclude:
+          - build_type: [RelWithDebInfo, Release, Asan, Tsan, Ubsan]
+            libs: static
         #   - config: "Linux GCC"
         #     build_type: Asan
         #     libs: shared
