@@ -47,33 +47,43 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
-        build_type: [Debug, RelWithDebInfo, Release, Asan, Tsan, Ubsan]
-        compiler: [gcc, clang]
+        config:
+          - name: "Linux GCC"
+            os: ubuntu-latest
+            cc: gcc
+            cxx: g++
+          - name: "Linux Clang"
+            os: ubuntu-latest
+            cc: clang
+            cxx: clang++
+          - name: "macOS Clang"
+            os: macos-latest
+            cc: clang
+            cxx: clang++
+        build_type: [Debug, RelWithDebInfo, Release]
         libs: [shared]
         include:
-          - os: ubuntu-latest
+          - config: "Linux GCC"
             build_type: Debug
-            compiler: gcc
             libs: static
-        exclude:
-          # Exclude sanitizer builds with clang
-          - build_type: Asan
-            compiler: clang
-          - build_type: Tsan
-            compiler: clang
-          - build_type: Ubsan
-            compiler: clang
-          - os: macos-latest
-            compiler: gcc
+          - config: "Linux GCC"
+            build_type: Asan
+            libs: shared
+          - config: "Linux GCC"
+            build_type: Tsan
+            libs: shared
+          - config: "Linux GCC"
+            build_type: Ubsan
+            libs: shared
 
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.config.os }}
 
     env:
       # Customize the CMake build type here (Release, Debug, RelWithDebInfo, etc.)
       MERCURY_BUILD_CONFIGURATION: ${{ matrix.build_type }}
       MERCURY_LIBS: ${{ matrix.libs }}
-      CC: ${{ matrix.compiler }}
+      CC: ${{ matrix.config.cc }}
+      CXX: ${{ matrix.config.cxx }}
       INSTALL_DIR: install
 
     steps:
@@ -110,7 +120,7 @@ jobs:
         run: Testing/script/gh_ctest.sh test
 
       - name: Coverage (Debug build only)
-        if: matrix.build_type == 'Debug' && matrix.compiler == 'gcc'
+        if: matrix.build_type == 'Debug' && matrix.config.cc == 'gcc'
         run: Testing/script/gh_ctest.sh coverage
 
       - name: Address Sanitizer (Asan build only)
