@@ -67,7 +67,7 @@ jobs:
         libs: [static, shared]
         exclude:
           - config:
-            - os: macos-latest
+            - {os: macos-latest}
         #   - config: "Linux GCC"
         #     build_type: Asan
         #     libs: shared
