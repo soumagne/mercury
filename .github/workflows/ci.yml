@@ -63,20 +63,21 @@ jobs:
               cc: clang,
               cxx: clang++
             }
-        build_type: [Debug, RelWithDebInfo, Release, Asan, Tsan, Ubsan]
-        libs: [static, shared]
-        exclude:
-          - config:
-            - {os: macos-latest}
-        #   - config: "Linux GCC"
-        #     build_type: Asan
-        #     libs: shared
-        #   - config: "Linux GCC"
-        #     build_type: Tsan
-        #     libs: shared
-        #   - config: "Linux GCC"
-        #     build_type: Ubsan
-        #     libs: shared
+        build_type: [Debug, RelWithDebInfo, Release]
+        libs: [shared]
+        include:
+          - config: {os: ubuntu-latest, cc: gcc, cxx: g++}
+            build_type: Debug
+            libs: static
+          - config: {os: ubuntu-latest, cc: gcc, cxx: g++}
+            build_type: Asan
+            libs: shared
+          - config: {os: ubuntu-latest, cc: gcc, cxx: g++}
+            build_type: Tsan
+            libs: shared
+          - config: {os: ubuntu-latest, cc: gcc, cxx: g++}
+            build_type: Ubsan
+            libs: shared
 
     runs-on: ${{ matrix.config.os }}
 
