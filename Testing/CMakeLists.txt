@@ -56,6 +56,11 @@ if(NA_USE_BMI)
   mark_as_advanced(NA_BMI_TESTING_PROTOCOL)
 endif()
 
+if(NA_USE_UCX)
+  set(NA_UCX_TESTING_PROTOCOL "all" CACHE STRING "Protocol(s) used for testing (e.g., tcp;ib).")
+  mark_as_advanced(NA_UCX_TESTING_PROTOCOL)
+endif()
+
 #Does not really make sense for MPI (so do not add an option for it)
 if(NA_USE_MPI)
   set(NA_MPI_TESTING_PROTOCOL "dynamic;static" CACHE STRING "Protocol(s) used for testing (e.g., dynamic;static).")
@@ -303,7 +308,8 @@ function(add_mercury_test_comm_kill_server test_name)
   foreach(comm ${NA_PLUGINS})
     string(TOUPPER ${comm} upper_comm)
     # Forward to remote server
-    if(NOT ((${comm} STREQUAL "bmi") OR (${comm} STREQUAL "mpi")))
+    if(NOT ((${comm} STREQUAL "bmi") OR (${comm} STREQUAL "mpi") OR
+            (${comm} STREQUAL "ucx")))
       add_mercury_test_comm(${test_name} ${comm}
         "${NA_${upper_comm}_TESTING_PROTOCOL}"
         "${NA_TESTING_NO_BLOCK}" false false true)
