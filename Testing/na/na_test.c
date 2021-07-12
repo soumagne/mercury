@@ -303,7 +303,7 @@ na_test_gen_config(struct na_test_info *na_test_info)
         }
 #endif
         if (na_test_info->listen) {
-            /* special-case SM (pid:id) */
+            /* special-case SM (pid/id) */
             sprintf(
                 info_string_ptr, "%d/%d", (int) getpid(), na_test_info->port);
         }

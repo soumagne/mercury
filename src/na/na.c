@@ -113,7 +113,7 @@ static const struct na_class_ops *const na_class_table[] = {
 #endif
 #ifdef NA_HAS_UCX
     &NA_PLUGIN_OPS(ucx2),
-    &NA_PLUGIN_OPS(ucx),
+    // &NA_PLUGIN_OPS(ucx),
 #endif
     NULL};
 
