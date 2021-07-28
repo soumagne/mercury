@@ -12,7 +12,8 @@
 
 #include "na_ip.h"
 
-// #include "mercury_hash_table.h"
+#include "mercury_hash_table.h"
+#include "mercury_thread_rwlock.h"
 // #include "mercury_time.h"
 
 #include <ucp/api/ucp.h>
@@ -30,11 +31,21 @@
 /* Default protocol */
 #define NA_UCX_PROTOCOL_DEFAULT "all"
 
+/* Addr status bits */
+// #define NA_SM_ADDR_RESERVED   (1 << 0)
+#define NA_UCX_ADDR_RESOLVING (1 << 1)
+#define NA_UCX_ADDR_RESOLVED  (1 << 2)
+
 /* Default max msg size */
 #define NA_UCX_MSG_SIZE_MAX (4096)
 
 /* Max tag */
 #define NA_UCX_MAX_TAG UINT32_MAX
+
+/* Reserved tags */
+#define NA_UCX_TAG_MASK        ((uint64_t) 0x00000000FFFFFFFF)
+#define NA_UCX_TAG_UNEXPECTED  ((uint64_t) 0x0000000100000000)
+#define NA_UCX_TAG_SENDER_MASK ((uint64_t) 0xFFFFFFFE00000000)
 
 /* Maximum number of pre-allocated IOV entries */
 #define NA_UCX_IOV_STATIC_MAX (8)
@@ -51,16 +62,53 @@
 #define NA_UCX_CONTEXT(na_context)                                             \
     ((struct na_ucx_context *) ((na_context)->plugin_context))
 
+/* Reset op ID */
+#define NA_UCX_OP_RESET(__op, __context, __cb_type, __cb, __arg, __addr)       \
+    do {                                                                       \
+        __op->context = __context;                                             \
+        __op->completion_data.callback_info.type = __cb_type;                  \
+        __op->completion_data.callback = __cb;                                 \
+        __op->completion_data.callback_info.arg = __arg;                       \
+        __op->addr = __addr;                                                   \
+        na_ucx_addr_ref_incr(__addr);                                          \
+        hg_atomic_set32(&__op->status, 0);                                     \
+    } while (0)
+
+#define NA_UCX_OP_RESET_NO_ADDR(__op, __context, __cb_type, __cb, __arg)       \
+    do {                                                                       \
+        __op->context = __context;                                             \
+        __op->completion_data.callback_info.type = __cb_type;                  \
+        __op->completion_data.callback = __cb;                                 \
+        __op->completion_data.callback_info.arg = __arg;                       \
+        hg_atomic_set32(&__op->status, 0);                                     \
+    } while (0)
+
+#define NA_UCX_OP_RELEASE(__op)                                                \
+    do {                                                                       \
+        if (__op->addr)                                                        \
+            na_ucx_addr_ref_decr(__op->addr);                                  \
+        hg_atomic_set32(&__op->status, NA_UCX_OP_COMPLETED);                   \
+    } while (0)
+
 /************************************/
 /* Local Type and Struct Definition */
 /************************************/
 
 /* Address */
 struct na_ucx_addr {
-    ucs_sock_addr_t sockaddr;   /* Sock addr */
-    uint32_t conn_id;           /* Connection ID */
-    ucp_ep_h ucp_ep;            /* Currently only one EP per address */
-    hg_atomic_int32_t refcount; /* Reference counter */
+    struct sockaddr_storage ss_addr; /* Sock addr */
+    ucs_sock_addr_t addr_key;        /* Address key */
+    ucp_ep_h ucp_ep;                 /* Currently only one EP per address */
+    uint32_t conn_id;                /* Connection ID (local) */
+    uint32_t remote_conn_id;         /* Connection ID (remote) */
+    hg_atomic_int32_t refcount;      /* Reference counter */
+    hg_atomic_int32_t status;        /* Status bits */
+};
+
+/* Map (used to cache addresses) */
+struct na_ucx_map {
+    hg_thread_rwlock_t lock;
+    hg_hash_table_t *map;
 };
 
 /* Memory descriptor info */
@@ -100,10 +148,10 @@ struct na_ucx_msg_info {
 /* Operation ID */
 struct na_ucx_op_id {
     struct na_cb_completion_data completion_data; /* Completion data    */
-    // union {
-    //     struct na_ucx_msg_info msg;
-    //     struct na_ucx_rma_info rma;
-    // } info;                             /* Op info                  */
+    union {
+        struct na_ucx_msg_info msg;
+        // struct na_ucx_rma_info rma;
+    } info;                             /* Op info                  */
     HG_QUEUE_ENTRY(na_ucx_op_id) entry; /* Entry in queue           */
     na_context_t *context;              /* NA context associated    */
     struct na_ucx_addr *addr;           /* Address associated       */
@@ -118,16 +166,18 @@ struct na_ucx_op_id {
 
 /* UCX class */
 struct na_ucx_class {
-    ucp_context_h ucp_context;              /* UCP context */
-    ucp_worker_h ucp_worker;                /* Shared UCP worker */
-    ucp_listener_h ucp_listener;            /* Listener handle if listening */
-    struct sockaddr_storage *listener_addr; /* Listener adress if listening */
-    struct na_ucx_addr *self_addr;          /* Self address */
-    size_t ucp_request_size;                /* Size of UCP requests */
-    char *protocol_name;                    /* Protocol used */
-    na_size_t unexpected_size_max;          /* Max unexpected size */
-    na_size_t expected_size_max;            /* Max expected size */
-    hg_atomic_int32_t ncontexts;            /* Number of contexts */
+    struct na_ucx_map addr_map;    /* Address map */
+    struct na_ucx_map conn_map;    /* Connection ID map */
+    ucp_context_h ucp_context;     /* UCP context */
+    ucp_worker_h ucp_worker;       /* Shared UCP worker */
+    ucp_listener_h ucp_listener;   /* Listener handle if listening */
+    struct na_ucx_addr *self_addr; /* Self address */
+    size_t ucp_request_size;       /* Size of UCP requests */
+    char *protocol_name;           /* Protocol used */
+    na_size_t unexpected_size_max; /* Max unexpected size */
+    na_size_t expected_size_max;   /* Max expected size */
+    hg_atomic_int32_t ncontexts;   /* Number of contexts */
+    na_bool_t no_wait;             /* Wait disabled */
 };
 
 /********************/
@@ -151,8 +201,9 @@ na_ucp_config_release(ucp_config_t *config);
  * Create context.
  */
 static na_return_t
-na_ucp_context_create(const ucp_config_t *config, ucs_thread_mode_t thread_mode,
-    ucp_context_h *context_p, size_t *request_size_p);
+na_ucp_context_create(const ucp_config_t *config, na_bool_t no_wait,
+    ucs_thread_mode_t thread_mode, ucp_context_h *context_p,
+    size_t *request_size_p);
 
 /**
  * Destroy context.
@@ -185,8 +236,7 @@ na_ucp_listener_create(ucp_worker_h context, const struct sockaddr *addr,
  * Destroy listener.
  */
 static void
-na_ucp_listener_destroy(
-    ucp_listener_h listener, struct sockaddr_storage *listener_addr);
+na_ucp_listener_destroy(ucp_listener_h listener);
 
 /**
  * Listener callback.
@@ -195,18 +245,110 @@ static void
 na_ucp_listener_conn_cb(ucp_conn_request_h conn_request, void *arg);
 
 /**
+ * Accept connection.
+ */
+static na_return_t
+na_ucp_accept(ucp_worker_h worker, ucp_conn_request_h conn_request,
+    ucp_err_handler_cb_t err_handler_cb, void *err_handler_arg, ucp_ep_h *ep_p);
+
+/**
+ * Establish connection.
+ */
+static na_return_t
+na_ucp_connect(ucp_worker_h worker, const struct sockaddr *addr,
+    socklen_t addrlen, ucp_err_handler_cb_t err_handler_cb,
+    void *err_handler_arg, ucp_ep_h *ep_p);
+
+/**
+ * Create endpoint.
+ */
+static na_return_t
+na_ucp_ep_create(ucp_worker_h worker, ucp_ep_params_t *ep_params,
+    ucp_err_handler_cb_t err_handler_cb, void *err_handler_arg, ucp_ep_h *ep_p);
+
+/**
+ * Error handler.
+ */
+static void
+na_ucp_ep_error_cb(void *arg, ucp_ep_h ep, ucs_status_t status);
+
+/**
+ * Get next connection ID.
+ */
+static uint32_t
+na_ucp_conn_id_gen(void);
+
+/**
+ * Exchange connection IDs.
+ */
+static na_return_t
+na_ucp_conn_id_exchange(ucp_ep_h ep, const uint32_t *local_conn_id,
+    uint32_t *remote_conn_id, void *arg);
+
+static void
+na_ucp_conn_id_send_cb(void *request, ucs_status_t status, void *user_data);
+
+static void
+na_ucp_conn_id_recv_cb(
+    void *request, ucs_status_t status, size_t length, void *user_data);
+
+/**
+ * Create a msg tag.
+ */
+static NA_INLINE ucp_tag_t
+na_ucp_tag_gen(uint32_t tag, uint8_t unexpected, uint32_t conn_id);
+
+/**
+ * Convert a msg tag to a connection ID.
+ */
+static NA_INLINE uint32_t
+na_ucp_tag_to_conn_id(ucp_tag_t tag);
+
+/**
+ * Send a msg.
+ */
+static na_return_t
+na_ucp_msg_send(ucp_ep_h ep, const void *buf, size_t buf_size, ucp_tag_t tag,
+    void *request);
+
+/**
  * Recv a msg.
  */
 static na_return_t
 na_ucp_msg_recv(ucp_worker_h worker, void *buf, size_t buf_size, ucp_tag_t tag,
-    ucp_tag_t tag_mask, void *request);
+    ucp_tag_t tag_mask, void *request, ucp_tag_recv_nbx_callback_t recv_cb);
 
 /**
- * Recv msg callback.
+ * Send msg callback.
  */
 static void
-na_ucp_msg_recv_cb(void *request, ucs_status_t status,
-    const ucp_tag_recv_info_t *info, void NA_UNUSED *user_data);
+na_ucp_msg_send_cb(void *request, ucs_status_t status, void *user_data);
+
+/**
+ * Recv unexpected msg callback.
+ */
+static void
+na_ucp_msg_recv_unexpected_cb(void *request, ucs_status_t status,
+    const ucp_tag_recv_info_t *info, void *user_data);
+
+/**
+ * Recv expected msg callback.
+ */
+static void
+na_ucp_msg_recv_expected_cb(void *request, ucs_status_t status,
+    const ucp_tag_recv_info_t *info, void *user_data);
+
+/**
+ * Allocate new UCX class.
+ */
+static struct na_ucx_class *
+na_ucx_class_alloc(void);
+
+/**
+ * Free UCX class.
+ */
+static void
+na_ucx_class_free(struct na_ucx_class *na_ucx_class);
 
 /**
  * Parse hostname info.
@@ -216,17 +358,50 @@ na_ucx_parse_hostname_info(const char *hostname_info, const char *subnet_info,
     char **net_device_p, struct sockaddr_storage **sockaddr_p);
 
 /**
- * Create self address.
+ * Hash address key.
+ */
+static NA_INLINE unsigned int
+na_ucx_addr_key_hash(hg_hash_table_key_t key);
+
+/**
+ * Compare address keys.
+ */
+static NA_INLINE int
+na_ucx_addr_key_equal(hg_hash_table_key_t key1, hg_hash_table_key_t key2);
+
+/**
+ * Lookup addr key from map.
+ */
+static NA_INLINE struct na_ucx_addr *
+na_ucx_addr_map_lookup(struct na_ucx_map *na_ucx_map,
+    const struct sockaddr *addr, socklen_t addrlen);
+
+/**
+ * Insert new addr key into map. Execute callback while write lock is acquired.
  */
 static na_return_t
-na_ucx_addr_self_create(const struct sockaddr *addr, socklen_t addrlen,
+na_ucx_addr_map_insert(struct na_ucx_map *na_ucx_map,
+    const struct sockaddr *addr, socklen_t addrlen,
     struct na_ucx_addr **na_ucx_addr_p);
 
 /**
- * Destroy self address.
+ * Remove addr key from map.
+ */
+static na_return_t
+na_ucx_addr_map_remove(struct na_ucx_map *na_ucx_map, na_uint64_t key);
+
+/**
+ * Create address.
+ */
+static na_return_t
+na_ucx_addr_create(const struct sockaddr *addr, socklen_t addrlen,
+    struct na_ucx_addr **na_ucx_addr_p);
+
+/**
+ * Destroy address.
  */
 static void
-na_ucx_addr_self_destroy(struct na_ucx_addr *na_ucx_addr);
+na_ucx_addr_destroy(struct na_ucx_addr *na_ucx_addr);
 
 /**
  * Increment ref count.
@@ -239,6 +414,19 @@ na_ucx_addr_ref_incr(struct na_ucx_addr *na_ucx_addr);
  */
 static NA_INLINE void
 na_ucx_addr_ref_decr(struct na_ucx_addr *na_ucx_addr);
+
+/**
+ * Resolve address.
+ */
+static na_return_t
+na_ucx_addr_resolve(
+    struct na_ucx_class *na_ucx_class, struct na_ucx_addr *na_ucx_addr);
+
+/**
+ * Complete UCX operation.
+ */
+static na_return_t
+na_ucx_complete(struct na_ucx_op_id *na_ucx_op_id, na_return_t cb_ret);
 
 /**
  * Release resources after NA callback execution.
@@ -286,10 +474,6 @@ na_ucx_addr_lookup(na_class_t *na_class, const char *name, na_addr_t *addr_p);
 /* addr_free */
 static NA_INLINE na_return_t
 na_ucx_addr_free(na_class_t *na_class, na_addr_t addr);
-
-/* addr_set_remove */
-static NA_INLINE na_return_t
-na_ucx_addr_set_remove(na_class_t *na_class, na_addr_t addr);
 
 /* addr_self */
 static NA_INLINE na_return_t
@@ -417,7 +601,7 @@ na_ucx_get(na_class_t *na_class, na_context_t *context, na_cb_t callback,
     na_op_id_t *op_id);
 
 /* poll_get_fd */
-static NA_INLINE int
+static int
 na_ucx_poll_get_fd(na_class_t *na_class, na_context_t *context);
 
 /* poll_try_wait */
@@ -449,7 +633,7 @@ const struct na_class_ops NA_PLUGIN_OPS(ucx2) = {
     na_ucx_op_destroy,                    /* op_destroy */
     na_ucx_addr_lookup,                   /* addr_lookup */
     na_ucx_addr_free,                     /* addr_free */
-    na_ucx_addr_set_remove,               /* addr_set_remove */
+    NULL,                                 /* addr_set_remove */
     na_ucx_addr_self,                     /* addr_self */
     na_ucx_addr_dup,                      /* addr_dup */
     na_ucx_addr_cmp,                      /* addr_cmp */
@@ -571,18 +755,24 @@ na_ucp_config_release(ucp_config_t *config)
 
 /*---------------------------------------------------------------------------*/
 static na_return_t
-na_ucp_context_create(const ucp_config_t *config, ucs_thread_mode_t thread_mode,
-    ucp_context_h *context_p, size_t *request_size_p)
+na_ucp_context_create(const ucp_config_t *config, na_bool_t no_wait,
+    ucs_thread_mode_t thread_mode, ucp_context_h *context_p,
+    size_t *request_size_p)
 {
     ucp_context_h context = NULL;
     ucp_params_t context_params = {
-        .field_mask = UCP_PARAM_FIELD_FEATURES | UCP_PARAM_FIELD_REQUEST_SIZE,
-        .features = UCP_FEATURE_TAG | UCP_FEATURE_RMA,
-        .request_size = sizeof(struct na_ucx_op_id)};
+        .field_mask =
+            UCP_PARAM_FIELD_FEATURES | UCP_PARAM_FIELD_TAG_SENDER_MASK,
+        .features = UCP_FEATURE_TAG | UCP_FEATURE_RMA | UCP_FEATURE_STREAM,
+        .tag_sender_mask = NA_UCX_TAG_SENDER_MASK};
     ucp_context_attr_t context_actuals = {
         .field_mask = UCP_ATTR_FIELD_REQUEST_SIZE | UCP_ATTR_FIELD_THREAD_MODE};
     ucs_status_t status;
     na_return_t ret;
+
+    /* Skip wakeup feature if not waiting */
+    if (no_wait != NA_TRUE)
+        context_params.features |= UCP_FEATURE_WAKEUP;
 
     if (thread_mode == UCS_THREAD_MODE_MULTI) {
         /* If the UCP context can potentially be used by more than one
@@ -620,6 +810,9 @@ na_ucp_context_create(const ucp_config_t *config, ucs_thread_mode_t thread_mode,
             context_actuals.thread_mode < thread_mode,
         error, ret, NA_PROTOCOL_ERROR, "Context thread mode is: %s",
         ucs_thread_mode_names[context_actuals.thread_mode]);
+
+    NA_LOG_SUBSYS_DEBUG(
+        cls, "UCP request size is %zu", context_actuals.request_size);
 
     *context_p = context;
     *request_size_p = context_actuals.request_size;
@@ -736,7 +929,8 @@ na_ucp_listener_create(ucp_worker_h worker, const struct sockaddr *addr,
         .field_mask = UCP_LISTENER_PARAM_FIELD_SOCK_ADDR |
                       UCP_LISTENER_PARAM_FIELD_CONN_HANDLER,
         .sockaddr = (ucs_sock_addr_t){.addr = addr, .addrlen = addrlen},
-        .conn_handler = {na_ucp_listener_conn_cb, listener_arg}};
+        .conn_handler = (ucp_listener_conn_handler_t){
+            .cb = na_ucp_listener_conn_cb, .arg = listener_arg}};
     ucp_listener_attr_t listener_actuals = {
         .field_mask = UCP_LISTENER_ATTR_FIELD_SOCKADDR};
     struct sockaddr_storage *ss_addr = NULL;
@@ -778,38 +972,55 @@ error:
 
 /*---------------------------------------------------------------------------*/
 static void
-na_ucp_listener_destroy(
-    ucp_listener_h listener, struct sockaddr_storage *listener_addr)
+na_ucp_listener_destroy(ucp_listener_h listener)
 {
     ucp_listener_destroy(listener);
-    free(listener_addr);
 }
 
 /*---------------------------------------------------------------------------*/
 static void
-na_ucp_listener_conn_cb(ucp_conn_request_h conn_request, void NA_UNUSED *arg)
+na_ucp_listener_conn_cb(ucp_conn_request_h conn_request, void *arg)
 {
+    struct na_ucx_class *na_ucx_class = (struct na_ucx_class *) arg;
     ucp_conn_request_attr_t conn_request_attrs = {
         .field_mask = UCP_CONN_REQUEST_ATTR_FIELD_CLIENT_ADDR};
+    struct na_ucx_addr *na_ucx_addr = NULL;
     ucs_status_t status;
-    char client_string[NI_MAXHOST];
-    int rc;
+    na_return_t na_ret;
 
     status = ucp_conn_request_query(conn_request, &conn_request_attrs);
     NA_CHECK_SUBSYS_ERROR_NORET(poll, status != UCS_OK, error,
         "ucp_conn_request_query() failed (%s)", ucs_status_string(status));
 
-    // ucp_ep_create();
-
-    rc = getnameinfo(
+    /* Lookup address from table */
+    na_ucx_addr = na_ucx_addr_map_lookup(&na_ucx_class->addr_map,
         (const struct sockaddr *) &conn_request_attrs.client_address,
-        sizeof(conn_request_attrs.client_address), client_string,
-        sizeof(client_string), NULL, 0, NI_NUMERICHOST | NI_NUMERICSERV);
-    NA_CHECK_SUBSYS_ERROR_NORET(poll, rc != 0, error,
-        "getnameinfo() failed (%s)", ucs_status_string(status));
+        sizeof(conn_request_attrs.client_address));
+    NA_CHECK_SUBSYS_ERROR_NORET(addr, na_ucx_addr != NULL, error,
+        "An entry is already present for this address");
 
-    NA_LOG_SUBSYS_DEBUG(
-        poll, "Received connection request from %s", client_string);
+    /* Insert new entry and create new address */
+    na_ret = na_ucx_addr_map_insert(&na_ucx_class->addr_map,
+        (const struct sockaddr *) &conn_request_attrs.client_address,
+        sizeof(conn_request_attrs.client_address), &na_ucx_addr);
+    NA_CHECK_SUBSYS_ERROR_NORET(addr,
+        na_ret != NA_SUCCESS && na_ret != NA_EXIST, error,
+        "Could not insert new address");
+
+    /* Accept connection */
+    na_ret = na_ucp_accept(na_ucx_class->ucp_worker, conn_request,
+        na_ucp_ep_error_cb, (void *) na_ucx_class, &na_ucx_addr->ucp_ep);
+    NA_CHECK_SUBSYS_NA_ERROR(
+        addr, error, na_ret, "Could not accept connection request");
+
+    /* Generate connection ID */
+    na_ucx_addr->conn_id = na_ucp_conn_id_gen();
+
+    /* Exchange IDs so that we can later use that ID to identify msg senders */
+    na_ret = na_ucp_conn_id_exchange(na_ucx_addr->ucp_ep, &na_ucx_addr->conn_id,
+        &na_ucx_addr->remote_conn_id, na_ucx_addr);
+    NA_CHECK_SUBSYS_NA_ERROR(
+        addr, error, na_ret, "Could not exchange connection IDs");
 
     return;
 
@@ -819,24 +1030,227 @@ error:
 
 /*---------------------------------------------------------------------------*/
 static na_return_t
-na_ucp_msg_recv(ucp_worker_h worker, void *buf, size_t buf_size, ucp_tag_t tag,
-    ucp_tag_t tag_mask, void *request)
+na_ucp_accept(ucp_worker_h worker, ucp_conn_request_h conn_request,
+    ucp_err_handler_cb_t err_handler_cb, void *err_handler_arg, ucp_ep_h *ep_p)
+{
+    ucp_ep_params_t ep_params = {.field_mask = UCP_EP_PARAM_FIELD_CONN_REQUEST,
+        .conn_request = conn_request};
+
+    return na_ucp_ep_create(
+        worker, &ep_params, err_handler_cb, err_handler_arg, ep_p);
+}
+
+/*---------------------------------------------------------------------------*/
+static na_return_t
+na_ucp_connect(ucp_worker_h worker, const struct sockaddr *addr,
+    socklen_t addrlen, ucp_err_handler_cb_t err_handler_cb,
+    void *err_handler_arg, ucp_ep_h *ep_p)
+{
+    ucp_ep_params_t ep_params = {
+        .field_mask = UCP_EP_PARAM_FIELD_FLAGS | UCP_EP_PARAM_FIELD_SOCK_ADDR,
+        .flags = UCP_EP_PARAMS_FLAGS_CLIENT_SERVER,
+        .sockaddr = (ucs_sock_addr_t){.addr = addr, .addrlen = addrlen}};
+
+    char sockaddr_str[60];
+    NA_LOG_SUBSYS_DEBUG(addr, "Connecting to %s, addrlen=%d",
+        ucs_sockaddr_str(addr, sockaddr_str, 60), addrlen);
+
+    return na_ucp_ep_create(
+        worker, &ep_params, err_handler_cb, err_handler_arg, ep_p);
+}
+
+/*---------------------------------------------------------------------------*/
+static uint32_t
+na_ucp_conn_id_gen(void)
+{
+    /* TODO improve that, not good enough */
+    static uint32_t conn_id = 1;
+    return conn_id++;
+}
+
+/*---------------------------------------------------------------------------*/
+static na_return_t
+na_ucp_conn_id_exchange(ucp_ep_h ep, const uint32_t *local_conn_id,
+    uint32_t *remote_conn_id, void *arg)
 {
     const ucp_request_param_t recv_params = {
-        .op_attr_mask =
-            UCP_OP_ATTR_FIELD_CALLBACK | UCP_OP_ATTR_FIELD_USER_DATA,
-        .cb = {.recv = na_ucp_msg_recv_cb},
+        .op_attr_mask = UCP_OP_ATTR_FIELD_CALLBACK |
+                        UCP_OP_ATTR_FIELD_USER_DATA |
+                        UCP_OP_ATTR_FIELD_DATATYPE | UCP_OP_ATTR_FIELD_FLAGS,
+        .cb = {.recv_stream = na_ucp_conn_id_recv_cb},
+        .user_data = arg,
+        .datatype = ucp_dt_make_contig(sizeof(uint32_t)),
+        .flags = UCP_STREAM_RECV_FLAG_WAITALL};
+    const ucp_request_param_t send_params = {
+        .op_attr_mask = UCP_OP_ATTR_FIELD_CALLBACK |
+                        UCP_OP_ATTR_FIELD_USER_DATA |
+                        UCP_OP_ATTR_FIELD_DATATYPE,
+        .cb = {.send = na_ucp_conn_id_send_cb},
+        .user_data = arg,
+        .datatype = ucp_dt_make_contig(sizeof(uint32_t))};
+    ucs_status_ptr_t send_ptr, recv_ptr;
+    na_return_t ret;
+    size_t recv_len;
+
+    /* Recv remote conn ID */
+    recv_ptr =
+        ucp_stream_recv_nbx(ep, remote_conn_id, 1, &recv_len, &recv_params);
+    if (recv_ptr == NULL) {
+        /* Completed immediately */
+        NA_LOG_SUBSYS_DEBUG(
+            addr, "ucp_stream_recv_nbx() completed immediately");
+    } else
+        NA_CHECK_SUBSYS_ERROR(addr, UCS_PTR_IS_ERR(recv_ptr), error, ret,
+            NA_PROTOCOL_ERROR, "ucp_stream_recv_nbx() failed (%s)",
+            ucs_status_string(UCS_PTR_STATUS(recv_ptr)));
+
+    /* Send local conn ID */
+    send_ptr = ucp_stream_send_nbx(ep, local_conn_id, 1, &send_params);
+    if (send_ptr == NULL) {
+        /* Completed immediately */
+        NA_LOG_SUBSYS_DEBUG(
+            addr, "ucp_stream_send_nbx() completed immediately");
+    } else
+        NA_CHECK_SUBSYS_ERROR(addr, UCS_PTR_IS_ERR(send_ptr), error, ret,
+            NA_PROTOCOL_ERROR, "ucp_stream_send_nbx() failed (%s)",
+            ucs_status_string(UCS_PTR_STATUS(send_ptr)));
+
+    return NA_SUCCESS;
+
+error:
+    return ret;
+}
+
+/*---------------------------------------------------------------------------*/
+static void
+na_ucp_conn_id_send_cb(void NA_UNUSED *request, ucs_status_t NA_UNUSED status,
+    void NA_UNUSED *user_data)
+{
+}
+
+/*---------------------------------------------------------------------------*/
+static void
+na_ucp_conn_id_recv_cb(
+    void *request, ucs_status_t status, size_t length, void *user_data)
+{
+    struct na_ucx_addr *na_ucx_addr = (struct na_ucx_addr *) user_data;
+
+    hg_atomic_set32(&na_ucx_addr->status, NA_UCX_ADDR_RESOLVED);
+}
+
+/*---------------------------------------------------------------------------*/
+static NA_INLINE ucp_tag_t
+na_ucp_tag_gen(uint32_t tag, uint8_t unexpected, uint32_t conn_id)
+{
+    return (ucp_tag_t) ((conn_id << 33) | ((unexpected & 0x1) << 32) | tag);
+}
+
+/*---------------------------------------------------------------------------*/
+static NA_INLINE uint32_t
+na_ucp_tag_to_conn_id(ucp_tag_t tag)
+{
+    return (uint32_t) ((tag & NA_UCX_TAG_SENDER_MASK) >> 33);
+}
+
+/*---------------------------------------------------------------------------*/
+static na_return_t
+na_ucp_ep_create(ucp_worker_h worker, ucp_ep_params_t *ep_params,
+    ucp_err_handler_cb_t err_handler_cb, void *err_handler_arg, ucp_ep_h *ep_p)
+{
+    ucp_ep_h ep = NULL;
+    ucs_status_t status;
+    na_return_t ret;
+
+    ep_params->field_mask |=
+        UCP_EP_PARAM_FIELD_ERR_HANDLER | UCP_EP_PARAM_FIELD_ERR_HANDLING_MODE;
+    ep_params->err_mode = UCP_ERR_HANDLING_MODE_PEER;
+    ep_params->err_handler.cb = err_handler_cb;
+    ep_params->err_handler.arg = err_handler_arg;
+
+    status = ucp_ep_create(worker, ep_params, &ep);
+    NA_CHECK_SUBSYS_ERROR(addr, status != UCS_OK, error, ret, NA_PROTOCOL_ERROR,
+        "ucp_ep_create() failed (%s)", ucs_status_string(status));
+
+    *ep_p = ep;
+
+    return NA_SUCCESS;
+
+error:
+    return ret;
+}
+
+/*---------------------------------------------------------------------------*/
+static void
+na_ucp_ep_error_cb(void *arg, ucp_ep_h NA_UNUSED ep, ucs_status_t status)
+{
+    if (UCS_STATUS_IS_ERR(status))
+        return;
+
+    NA_LOG_WARNING("Detected error: %s", ucs_status_string(status));
+
+    /* the upper layer should close the connection */
+    // if (is_established()) {
+    //     _context.handle_connection_error(this);
+    // } else {
+    //     _context.remove_connection_inprogress(this);
+    //     invoke_callback(_establish_cb, status);
+    // }
+}
+
+/*---------------------------------------------------------------------------*/
+static na_return_t
+na_ucp_msg_send(
+    ucp_ep_h ep, const void *buf, size_t buf_size, ucp_tag_t tag, void *request)
+{
+    const ucp_request_param_t send_params = {
+        .op_attr_mask = UCP_OP_ATTR_FIELD_CALLBACK | UCP_OP_ATTR_FIELD_REQUEST,
+        .cb = {.send = na_ucp_msg_send_cb},
+        .request = request};
+    ucs_status_ptr_t status_ptr;
+    na_return_t ret;
+
+    status_ptr = ucp_tag_send_nbx(ep, buf, buf_size, tag, &send_params);
+    if (status_ptr == NULL) {
+        /* Check for immediate completion */
+        NA_LOG_SUBSYS_DEBUG(msg, "Operation completed immediately");
+    } else
+        NA_CHECK_SUBSYS_ERROR(msg, UCS_PTR_IS_ERR(status_ptr), error, ret,
+            NA_PROTOCOL_ERROR, "ucp_tag_recv_nbx() failed (%s)",
+            ucs_status_string(UCS_PTR_STATUS(status_ptr)));
+
+    if (status_ptr != NULL)
+        NA_LOG_SUBSYS_DEBUG(msg, "Operation was scheduled");
+
+    return NA_SUCCESS;
+
+error:
+    return ret;
+}
+
+/*---------------------------------------------------------------------------*/
+static na_return_t
+na_ucp_msg_recv(ucp_worker_h worker, void *buf, size_t buf_size, ucp_tag_t tag,
+    ucp_tag_t tag_mask, void *request, ucp_tag_recv_nbx_callback_t recv_cb)
+{
+    const ucp_request_param_t recv_params = {
+        .op_attr_mask = UCP_OP_ATTR_FIELD_CALLBACK | UCP_OP_ATTR_FIELD_REQUEST,
+        .cb = {.recv = recv_cb},
         .request = request};
     ucs_status_ptr_t status_ptr;
     na_return_t ret;
 
     status_ptr =
         ucp_tag_recv_nbx(worker, buf, buf_size, tag, tag_mask, &recv_params);
-    NA_CHECK_SUBSYS_ERROR(msg, UCS_PTR_IS_ERR(status_ptr), error, ret,
-        NA_PROTOCOL_ERROR, "ucp_tag_recv_nbx() failed (%s)",
-        ucs_status_string(UCS_PTR_STATUS(status_ptr)));
+    if (status_ptr == NULL) {
+        /* Check for immediate completion */
+        NA_LOG_SUBSYS_DEBUG(msg, "Operation completed immediately");
+    } else
+        NA_CHECK_SUBSYS_ERROR(msg, UCS_PTR_IS_ERR(status_ptr), error, ret,
+            NA_PROTOCOL_ERROR, "ucp_tag_recv_nbx() failed (%s)",
+            ucs_status_string(UCS_PTR_STATUS(status_ptr)));
 
-    /* TODO check for immediate completion */
+    if (status_ptr != NULL)
+        NA_LOG_SUBSYS_DEBUG(msg, "Operation was scheduled");
 
     return NA_SUCCESS;
 
@@ -847,72 +1261,140 @@ error:
 
 /*---------------------------------------------------------------------------*/
 static void
-na_ucp_msg_recv_cb(void *request, ucs_status_t status,
+na_ucp_msg_send_cb(
+    void *request, ucs_status_t status, void NA_UNUSED *user_data)
+{
+    struct na_ucx_op_id *na_ucx_op_id = (struct na_ucx_op_id *) request;
+    na_return_t cb_ret = NA_SUCCESS;
+
+    NA_LOG_SUBSYS_DEBUG(
+        msg, "ucp_tag_send_nbx() completed (%s)", ucs_status_string(status));
+
+    if (status == UCS_ERR_CANCELED)
+        NA_GOTO_DONE(done, cb_ret, NA_CANCELED);
+    else
+        NA_CHECK_SUBSYS_ERROR(msg, status != UCS_OK, done, cb_ret,
+            NA_PROTOCOL_ERROR, "na_ucp_msg_send_cb() failed (%s)",
+            ucs_status_string(status));
+
+done:
+    na_ucx_complete(na_ucx_op_id, status);
+}
+
+/*---------------------------------------------------------------------------*/
+static void
+na_ucp_msg_recv_unexpected_cb(void *request, ucs_status_t status,
     const ucp_tag_recv_info_t *info, void NA_UNUSED *user_data)
 {
-    //     static const struct na_cb_info_recv_unexpected
-    //     recv_unexpected_errinfo = {
-    //         .actual_buf_size = 0, .source = NA_ADDR_NULL, .tag = 0};
-    //     na_op_id_t *op = request;
-    //     na_ucx_context_t *nuctx = op->ctx.nu;
-    //     struct na_cb_info *cbinfo = &op->completion_data.callback_info;
-    //     struct na_cb_info_recv_unexpected *recv_unexpected =
-    //         &cbinfo->info.recv_unexpected;
-    //     const op_status_t expected_status =
-    //         (status == UCS_ERR_CANCELED) ? op_s_canceled : op_s_underway;
+    struct na_ucx_op_id *na_ucx_op_id = (struct na_ucx_op_id *) request;
+    na_cb_type_t cb_type = na_ucx_op_id->completion_data.callback_info.type;
+    na_return_t cb_ret = NA_SUCCESS;
 
-    //     if (hg_atomic_get32(&op->status) != (hg_util_int32_t)
-    //     expected_status) {
-    //         NA_LOG_ERROR("op id %p: expected status %s, found %s", (void *)
-    //         op,
-    //             op_status_string(expected_status),
-    //             op_status_string(op->status));
-    //     }
+    NA_LOG_SUBSYS_DEBUG(
+        msg, "ucp_tag_recv_nbx() completed (%s)", ucs_status_string(status));
 
-    //     hg_atomic_set32(&op->status, op_s_complete);
+    if (status == UCS_ERR_CANCELED)
+        NA_GOTO_DONE(done, cb_ret, NA_CANCELED);
+    else
+        NA_CHECK_SUBSYS_ERROR(msg, status != UCS_OK, done, cb_ret,
+            NA_PROTOCOL_ERROR, "ucp_tag_recv_nbx() failed (%s)",
+            ucs_status_string(status));
 
-    //     if (status == UCS_OK) {
-    //         wire_id_t wire_id;
-    //         const void *buf = op->info.rx.buf;
-    //         void *data;
-    //         na_addr_t source;
+    NA_CHECK_SUBSYS_ERROR(msg, cb_type != NA_CB_RECV_UNEXPECTED, done, cb_ret,
+        NA_INVALID_ARG, "Invalid cb_type %d, expected NA_CB_RECV_UNEXPECTED",
+        cb_type);
+    NA_CHECK_SUBSYS_ERROR(msg,
+        (info->sender_tag & ~NA_UCX_TAG_UNEXPECTED) > NA_UCX_MAX_TAG, done,
+        cb_ret, NA_OVERFLOW, "Invalid tag value %" PRIu64, info->sender_tag);
 
-    //         // XXX use standard endianness
-    //         memcpy(&wire_id.id, buf, sizeof(wire_id.id));
+    NA_LOG_SUBSYS_DEBUG(msg, "Received msg length=%zu, sender_tag=%zu",
+        info->length, info->sender_tag & NA_UCX_TAG_MASK);
 
-    //         if (cbinfo->type != NA_CB_RECV_UNEXPECTED) {
-    //             source = NULL;
-    //         } else if ((data = wire_get_data(&nuctx->wiring, wire_id)) ==
-    //                    wire_data_nil) {
-    //             *recv_unexpected = recv_unexpected_errinfo;
-    //             cbinfo->ret = NA_PROTOCOL_ERROR;
-    //             goto out;
-    //         } else {
-    //             source = data;
-    //             addr_incref(source, "sender address");
-    //         }
+done:
+    na_ucx_complete(na_ucx_op_id, cb_ret);
+}
 
-    //         assert((info->sender_tag & nuctx->app.tagmask) ==
-    //         nuctx->app.tag);
+/*---------------------------------------------------------------------------*/
+static void
+na_ucp_msg_recv_expected_cb(void *request, ucs_status_t status,
+    const ucp_tag_recv_info_t *info, void NA_UNUSED *user_data)
+{
+    struct na_ucx_op_id *na_ucx_op_id = (struct na_ucx_op_id *) request;
+    na_cb_type_t cb_type = na_ucx_op_id->completion_data.callback_info.type;
+    na_return_t cb_ret = NA_SUCCESS;
 
-    //         *recv_unexpected = (struct na_cb_info_recv_unexpected){
-    //             .actual_buf_size = (na_size_t) info->length,
-    //             .source = source,
-    //             .tag = (na_tag_t) ((info->sender_tag & ~nuctx->msg.tagmask)
-    //             >>
-    //                                nuctx->msg.tagshift)};
+    NA_LOG_SUBSYS_DEBUG(
+        msg, "ucp_tag_recv_nbx() completed (%s)", ucs_status_string(status));
 
-    //         cbinfo->ret = NA_SUCCESS;
-    //     } else if (status == UCS_ERR_CANCELED) {
-    //         *recv_unexpected = recv_unexpected_errinfo;
-    //         cbinfo->ret = NA_CANCELED;
-    //     } else {
-    //         *recv_unexpected = recv_unexpected_errinfo;
-    //         cbinfo->ret = NA_PROTOCOL_ERROR;
-    //     }
+    if (status == UCS_ERR_CANCELED)
+        NA_GOTO_DONE(done, cb_ret, NA_CANCELED);
+    else
+        NA_CHECK_SUBSYS_ERROR(msg, status != UCS_OK, done, cb_ret,
+            NA_PROTOCOL_ERROR, "ucp_tag_recv_nbx() failed (%s)",
+            ucs_status_string(status));
 
-    // out:
-    //     na_cb_completion_add(op->ctx.na, &op->completion_data);
+    NA_CHECK_SUBSYS_ERROR(msg, cb_type != NA_CB_RECV_EXPECTED, done, cb_ret,
+        NA_INVALID_ARG, "Invalid cb_type %d, expected NA_CB_RECV_EXPECTED",
+        cb_type);
+    NA_CHECK_SUBSYS_ERROR(msg, info->sender_tag > NA_UCX_MAX_TAG, done, cb_ret,
+        NA_OVERFLOW, "Invalid tag value");
+
+    NA_LOG_SUBSYS_DEBUG(msg, "Received msg length=%zu, sender_tag=%zu",
+        info->length, info->sender_tag);
+
+done:
+    na_ucx_complete(na_ucx_op_id, cb_ret);
+}
+
+/*---------------------------------------------------------------------------*/
+static struct na_ucx_class *
+na_ucx_class_alloc(void)
+{
+    struct na_ucx_class *na_ucx_class = NULL;
+    int rc;
+
+    na_ucx_class = calloc(1, sizeof(*na_ucx_class));
+    NA_CHECK_SUBSYS_ERROR_NORET(cls, na_ucx_class == NULL, error,
+        "Could not allocate NA private data class");
+
+    /* Init table lock */
+    rc = hg_thread_rwlock_init(&na_ucx_class->addr_map.lock);
+    NA_CHECK_SUBSYS_ERROR_NORET(
+        cls, rc != HG_UTIL_SUCCESS, error, "hg_thread_rwlock_init() failed");
+
+    /* Create address table */
+    na_ucx_class->addr_map.map =
+        hg_hash_table_new(na_ucx_addr_key_hash, na_ucx_addr_key_equal);
+    NA_CHECK_SUBSYS_ERROR_NORET(cls, na_ucx_class->addr_map.map == NULL, error,
+        "Could not allocate address table");
+
+    return na_ucx_class;
+
+error:
+    if (na_ucx_class)
+        na_ucx_class_free(na_ucx_class);
+
+    return NULL;
+}
+
+/*---------------------------------------------------------------------------*/
+static void
+na_ucx_class_free(struct na_ucx_class *na_ucx_class)
+{
+    if (na_ucx_class->self_addr)
+        na_ucx_addr_destroy(na_ucx_class->self_addr);
+    if (na_ucx_class->ucp_listener)
+        na_ucp_listener_destroy(na_ucx_class->ucp_listener);
+    if (na_ucx_class->ucp_worker)
+        na_ucp_worker_destroy(na_ucx_class->ucp_worker);
+    if (na_ucx_class->ucp_context)
+        na_ucp_context_destroy(na_ucx_class->ucp_context);
+
+    if (na_ucx_class->addr_map.map)
+        hg_hash_table_free(na_ucx_class->addr_map.map);
+    (void) hg_thread_rwlock_destroy(&na_ucx_class->addr_map.lock);
+
+    free(na_ucx_class);
 }
 
 /*---------------------------------------------------------------------------*/
@@ -926,8 +1408,6 @@ na_ucx_parse_hostname_info(const char *hostname_info, const char *subnet_info,
 
     /* Set hostname (use default interface name if no hostname was passed) */
     if (hostname_info) {
-        char *parse_str = NULL;
-
         hostname = strdup(hostname_info);
         NA_CHECK_SUBSYS_ERROR(cls, hostname == NULL, done, ret, NA_NOMEM,
             "strdup() of hostname failed");
@@ -972,30 +1452,167 @@ done:
 }
 
 /*---------------------------------------------------------------------------*/
+static unsigned int
+na_ucx_addr_key_hash(hg_hash_table_key_t key)
+{
+    ucs_sock_addr_t *addr_key = (ucs_sock_addr_t *) key;
+
+    if (addr_key->addr->sa_family == AF_INET)
+        return (unsigned int) ((const struct sockaddr_in *) addr_key->addr)
+            ->sin_addr.s_addr;
+    else
+        return (unsigned int) ((const struct sockaddr_in6 *) addr_key->addr)
+            ->sin6_addr.__in6_u.__u6_addr32[0];
+}
+
+/*---------------------------------------------------------------------------*/
+static int
+na_ucx_addr_key_equal(hg_hash_table_key_t key1, hg_hash_table_key_t key2)
+{
+    ucs_sock_addr_t *addr_key1 = (ucs_sock_addr_t *) key1,
+                    *addr_key2 = (ucs_sock_addr_t *) key2;
+
+    return (addr_key1->addrlen == addr_key2->addrlen) &&
+           (memcmp(&addr_key1->addr, &addr_key2->addr, addr_key1->addrlen));
+}
+
+/*---------------------------------------------------------------------------*/
+static NA_INLINE struct na_ucx_addr *
+na_ucx_addr_map_lookup(struct na_ucx_map *na_ucx_map,
+    const struct sockaddr *addr, socklen_t addrlen)
+{
+    ucs_sock_addr_t sockaddr = {.addr = addr, .addrlen = addrlen};
+    hg_hash_table_value_t value = NULL;
+
+    /* Lookup key */
+    hg_thread_rwlock_rdlock(&na_ucx_map->lock);
+    value =
+        hg_hash_table_lookup(na_ucx_map->map, (hg_hash_table_key_t) &sockaddr);
+    hg_thread_rwlock_release_rdlock(&na_ucx_map->lock);
+
+    return (value == HG_HASH_TABLE_NULL) ? NULL : (struct na_ucx_addr *) value;
+}
+
+/*---------------------------------------------------------------------------*/
 static na_return_t
-na_ucx_addr_self_create(const struct sockaddr *addr, socklen_t addrlen,
+na_ucx_addr_map_insert(struct na_ucx_map *na_ucx_map,
+    const struct sockaddr *addr, socklen_t addrlen,
     struct na_ucx_addr **na_ucx_addr_p)
 {
-    struct na_ucx_addr *na_ucx_addr;
-    na_return_t ret = NA_SUCCESS;
+    struct na_ucx_addr *na_ucx_addr = NULL;
+    ucs_sock_addr_t addr_key = {.addr = addr, .addrlen = addrlen};
+    na_return_t ret;
+    int rc;
 
-    na_ucx_addr = malloc(sizeof(*na_ucx_addr));
+    hg_thread_rwlock_wrlock(&na_ucx_map->lock);
 
-    na_ucx_addr->sockaddr = (ucs_sock_addr_t){.addr = addr, .addrlen = addrlen};
+    /* Look up again to prevent race between lock release/acquire */
+    na_ucx_addr = (struct na_ucx_addr *) hg_hash_table_lookup(
+        na_ucx_map->map, (hg_hash_table_key_t) &addr_key);
+    if (na_ucx_addr) {
+        ret = NA_EXIST; /* Entry already exists */
+        goto done;
+    }
 
-    na_ucx_addr->conn_id = 0;
-    na_ucx_addr->ucp_ep = NULL;
-    hg_atomic_init32(&na_ucx_addr->refcount, 1);
+    /* Allocate address */
+    ret = na_ucx_addr_create(addr, addrlen, &na_ucx_addr);
+    NA_CHECK_SUBSYS_NA_ERROR(addr, done, ret, "Could not allocate NA UCX addr");
+
+    /* Insert new value */
+    rc = hg_hash_table_insert(na_ucx_map->map,
+        (hg_hash_table_key_t) &na_ucx_addr->addr_key,
+        (hg_hash_table_value_t) na_ucx_addr);
+    NA_CHECK_SUBSYS_ERROR(
+        addr, rc == 0, error, ret, NA_NOMEM, "hg_hash_table_insert() failed");
+
+done:
+    hg_thread_rwlock_release_wrlock(&na_ucx_map->lock);
 
     *na_ucx_addr_p = na_ucx_addr;
+
+    return NA_SUCCESS;
+
+error:
+    hg_thread_rwlock_release_wrlock(&na_ucx_map->lock);
+    if (na_ucx_addr)
+        na_ucx_addr_destroy(na_ucx_addr);
 
     return ret;
 }
 
 /*---------------------------------------------------------------------------*/
-static void
-na_ucx_addr_self_destroy(struct na_ucx_addr *na_ucx_addr)
+static na_return_t
+na_ucx_addr_map_remove(struct na_ucx_map *na_ucx_map, na_uint64_t key)
 {
+    hg_hash_table_key_t key_ptr = (hg_hash_table_key_t) &key;
+    na_return_t ret = NA_SUCCESS;
+    int rc;
+
+    hg_thread_rwlock_wrlock(&na_ucx_map->lock);
+    if (hg_hash_table_lookup(na_ucx_map->map, key_ptr) == HG_HASH_TABLE_NULL)
+        goto unlock;
+
+    rc = hg_hash_table_remove(na_ucx_map->map, key_ptr);
+    NA_CHECK_SUBSYS_ERROR_DONE(addr, rc == 0, "Could not remove key");
+
+unlock:
+    hg_thread_rwlock_release_wrlock(&na_ucx_map->lock);
+
+    return ret;
+}
+
+/*---------------------------------------------------------------------------*/
+static na_return_t
+na_ucx_addr_create(const struct sockaddr *addr, socklen_t addrlen,
+    struct na_ucx_addr **na_ucx_addr_p)
+{
+    struct na_ucx_addr *na_ucx_addr;
+    na_return_t ret;
+
+    na_ucx_addr = calloc(1, sizeof(*na_ucx_addr));
+    NA_CHECK_SUBSYS_ERROR(addr, na_ucx_addr == NULL, error, ret, NA_NOMEM,
+        "Could not allocate NA UCX addr");
+
+    if (addr)
+        memcpy(&na_ucx_addr->ss_addr, addr, addrlen);
+
+    /* Point key back to ss_addr */
+    na_ucx_addr->addr_key.addr =
+        (const struct sockaddr *) &na_ucx_addr->ss_addr;
+    na_ucx_addr->addr_key.addrlen = addrlen;
+
+    na_ucx_addr->ucp_ep = NULL;
+    hg_atomic_init32(&na_ucx_addr->refcount, 1);
+    hg_atomic_init32(&na_ucx_addr->status, 0);
+
+    if (addr) {
+        char host_string[NI_MAXHOST];
+        char serv_string[NI_MAXSERV];
+        int rc;
+
+        rc = getnameinfo(addr, addrlen, host_string, sizeof(host_string),
+            serv_string, sizeof(serv_string), NI_NUMERICHOST | NI_NUMERICSERV);
+        NA_CHECK_SUBSYS_ERROR(addr, rc != 0, error, ret, NA_PROTOCOL_ERROR,
+            "getnameinfo() failed (%s)", gai_strerror(rc));
+
+        NA_LOG_SUBSYS_DEBUG(
+            addr, "Created new address for %s:%s", host_string, serv_string);
+    }
+
+    *na_ucx_addr_p = na_ucx_addr;
+
+    return NA_SUCCESS;
+
+error:
+    return ret;
+}
+
+/*---------------------------------------------------------------------------*/
+static void
+na_ucx_addr_destroy(struct na_ucx_addr *na_ucx_addr)
+{
+    if (na_ucx_addr->ucp_ep)
+        ucp_ep_destroy(na_ucx_addr->ucp_ep);
     free(na_ucx_addr);
 }
 
@@ -1016,6 +1633,144 @@ na_ucx_addr_ref_decr(struct na_ucx_addr *na_ucx_addr)
 }
 
 /*---------------------------------------------------------------------------*/
+static na_return_t
+na_ucx_addr_resolve(
+    struct na_ucx_class *na_ucx_class, struct na_ucx_addr *na_ucx_addr)
+{
+    na_return_t ret;
+
+    /* Let only one thread at a time resolving the address */
+    if (!hg_atomic_cas32(&na_ucx_addr->status, 0, NA_UCX_ADDR_RESOLVING))
+        return NA_SUCCESS;
+
+    /* Create new endpoint */
+    ret = na_ucp_connect(na_ucx_class->ucp_worker, na_ucx_addr->addr_key.addr,
+        na_ucx_addr->addr_key.addrlen, na_ucp_ep_error_cb,
+        (void *) na_ucx_class, &na_ucx_addr->ucp_ep);
+    NA_CHECK_SUBSYS_NA_ERROR(
+        addr, error, ret, "Could not connect UCP endpoint");
+
+    /* Generate connection ID */
+    na_ucx_addr->conn_id = na_ucp_conn_id_gen();
+
+    /* Exchange IDs so that we can later use that ID to identify msg senders */
+    ret = na_ucp_conn_id_exchange(na_ucx_addr->ucp_ep, &na_ucx_addr->conn_id,
+        &na_ucx_addr->remote_conn_id, na_ucx_addr);
+    NA_CHECK_SUBSYS_NA_ERROR(
+        addr, error, ret, "Could not exchange connection IDs");
+
+    return NA_SUCCESS;
+
+error:
+    return ret;
+}
+
+/*---------------------------------------------------------------------------*/
+static NA_INLINE void
+na_ucx_op_retry(struct na_ucx_class *na_ucx_class, struct na_sm_op_id *na_sm_op_id)
+{
+    struct na_ucx_op_queue *retry_op_queue =
+        &na_ucx_class->retry_op_queue;
+
+    NA_LOG_SUBSYS_DEBUG(op, "Pushing %p for retry", (void *) na_sm_op_id);
+
+    /* Push op ID to retry queue */
+    hg_thread_spin_lock(&retry_op_queue->lock);
+    HG_QUEUE_PUSH_TAIL(&retry_op_queue->queue, na_sm_op_id, entry);
+    hg_atomic_or32(&na_sm_op_id->status, NA_SM_OP_QUEUED);
+    hg_thread_spin_unlock(&retry_op_queue->lock);
+}
+
+/*---------------------------------------------------------------------------*/
+static na_return_t
+na_ucx_complete(struct na_ucx_op_id *na_ucx_op_id, na_return_t cb_ret)
+{
+    struct na_cb_info *callback_info = NULL;
+    na_return_t ret;
+    hg_util_int32_t status;
+
+    /* Mark op id as completed before checking for cancelation */
+    status = hg_atomic_or32(&na_ucx_op_id->status, NA_UCX_OP_COMPLETED);
+
+    /* Init callback info */
+    callback_info = &na_ucx_op_id->completion_data.callback_info;
+
+    /* Set callback ret */
+    callback_info->ret = cb_ret;
+
+    /* Check for current status before completing */
+    if (status & NA_UCX_OP_CANCELED) {
+        /* If it was canceled while being processed, set callback ret
+         * accordingly */
+        NA_LOG_SUBSYS_DEBUG(
+            op, "Operation ID %p is canceled", (void *) na_ucx_op_id);
+    } else if (status & NA_UCX_OP_ERRORED) {
+        /* If it was errored, set callback ret accordingly */
+        NA_LOG_SUBSYS_DEBUG(
+            op, "Operation ID %p is errored", (void *) na_ucx_op_id);
+    }
+
+    switch (callback_info->type) {
+        case NA_CB_RECV_UNEXPECTED:
+            if (callback_info->ret != NA_SUCCESS) {
+                /* In case of cancellation where no recv'd data */
+                callback_info->info.recv_unexpected.actual_buf_size = 0;
+                callback_info->info.recv_unexpected.source = NA_ADDR_NULL;
+                callback_info->info.recv_unexpected.tag = 0;
+            } else {
+                /* Increment addr ref count */
+                na_ucx_addr_ref_incr(na_ucx_op_id->addr);
+
+                /* Fill callback info */
+                // callback_info->info.recv_unexpected.actual_buf_size =
+                //     na_ucx_op_id->info.msg.actual_buf_size;
+                // callback_info->info.recv_unexpected.source =
+                //     (na_addr_t) na_ucx_op_id->addr;
+                // callback_info->info.recv_unexpected.tag =
+                //     na_ucx_op_id->info.msg.tag;
+            }
+            break;
+        case NA_CB_RECV_EXPECTED:
+            /* Check buf_size and msg_size */
+            // NA_CHECK_SUBSYS_ERROR(msg,
+            //     na_ucx_op_id->info.msg.actual_buf_size >
+            //         na_ucx_op_id->info.msg.buf_size,
+            //     out, ret, NA_MSGSIZE,
+            //     "Expected recv msg size too large for buffer");
+            break;
+        case NA_CB_SEND_UNEXPECTED:
+        case NA_CB_SEND_EXPECTED:
+            break;
+        case NA_CB_PUT:
+        case NA_CB_GET:
+            // /* Can free extra IOVs here */
+            // if (na_ucx_op_id->info.rma.local_iovcnt > na_ucx_IOV_STATIC_MAX)
+            // {
+            //     free(na_ucx_op_id->info.rma.local_iov.d);
+            //     na_ucx_op_id->info.rma.local_iov.d = NULL;
+            // }
+            // if (na_ucx_op_id->info.rma.remote_iovcnt > na_ucx_IOV_STATIC_MAX)
+            // {
+            //     free(na_ucx_op_id->info.rma.remote_iov.d);
+            //     na_ucx_op_id->info.rma.remote_iov.d = NULL;
+            // }
+            break;
+        default:
+            NA_GOTO_SUBSYS_ERROR(op, error, ret, NA_INVALID_ARG,
+                "Operation type %d not supported", callback_info->type);
+            break;
+    }
+
+    /* Add OP to NA completion queue */
+    na_cb_completion_add(na_ucx_op_id->context, &na_ucx_op_id->completion_data);
+
+    return NA_SUCCESS;
+
+error:
+    return ret;
+}
+
+/*---------------------------------------------------------------------------*/
 static NA_INLINE void
 na_ucx_release(void *arg)
 {
@@ -1027,420 +1782,10 @@ na_ucx_release(void *arg)
         "Releasing resources from an uncompleted operation");
 
     if (na_ucx_op_id->addr) {
-        // na_ucx_addr_decref(na_ofi_op_id->addr);
+        na_ucx_addr_ref_decr(na_ucx_op_id->addr);
         na_ucx_op_id->addr = NULL;
     }
 }
-
-/*---------------------------------------------------------------------------*/
-
-// static void
-// tagged_send(na_ucx_context_t *nuctx, const void *buf, na_size_t buf_size,
-//     ucp_ep_h ep, sender_id_t sender_id, uint64_t tag, na_op_id_t *op)
-// {
-//     const ucp_request_param_t tx_params = {
-//         .op_attr_mask = UCP_OP_ATTR_FIELD_CALLBACK |
-//         UCP_OP_ATTR_FIELD_REQUEST, .cb = {.send = send_callback}, .request =
-//         op};
-//     ucs_status_ptr_t request;
-
-//     assert(buf_size >= sizeof(sender_id));
-
-//     // XXX use standard endianness
-//     memcpy((void *) (uintptr_t) buf, &sender_id, sizeof(sender_id));
-
-//     wiring_ref_get(&nuctx->wiring, &op->ref);
-//     request = ucp_tag_send_nbx(ep, buf, buf_size, tag, &tx_params);
-
-//     if (UCS_PTR_IS_ERR(request)) {
-//         NA_LOG_ERROR(
-//             "ucp_tag_send_nbx: %s",
-//             ucs_status_string(UCS_PTR_STATUS(request)));
-//         hg_atomic_set32(&op->status, op_s_complete);
-//         op->completion_data.callback_info.ret = NA_PROTOCOL_ERROR;
-//         wiring_ref_put(&nuctx->wiring, &op->ref);
-//         na_cb_completion_add(op->ctx.na, &op->completion_data);
-//     } else if (request == UCS_OK) {
-//         // send was immediate: queue completion
-//         hg_atomic_set32(&op->status, op_s_complete);
-//         op->completion_data.callback_info.ret = NA_SUCCESS;
-//         wiring_ref_put(&nuctx->wiring, &op->ref);
-//         na_cb_completion_add(op->ctx.na, &op->completion_data);
-//     }
-// }
-
-// static bool
-// wire_event_callback(wire_event_info_t info, void *arg)
-// {
-//     address_wire_aseq_t aseq;
-//     address_wire_t *cache = arg;
-//     na_op_id_t *op;
-//     na_ucx_addr_t *owner = cache->owner;
-
-//     assert(info.event == wire_ev_estd || info.event == wire_ev_closed ||
-//            info.event == wire_ev_reclaimed);
-
-//     wiring_assert_locked(&cache->ctx->wiring);
-
-//     if (info.event == wire_ev_closed) {
-//         assert(HG_QUEUE_IS_EMPTY(&cache->deferrals));
-
-//         return true;
-//     }
-
-//     if (info.event == wire_ev_reclaimed) {
-//         /* No in-flight wireup operations will reference this wire
-//          * so it has been reclaimed.
-//          */
-//         aseq = address_wire_write_begin(cache);
-//         atomic_store_explicit(
-//             &cache->sender_id, sender_id_nil, memory_order_relaxed);
-//         atomic_store_explicit(
-//             &cache->wire_id.id, sender_id_nil, memory_order_relaxed);
-//         atomic_store_explicit(&cache->ep, NULL, memory_order_relaxed);
-//         address_wire_write_end(aseq);
-
-//         /* Now the address can be reclaimed
-//          * safely, too.  Decrease the reference count that we increased when
-//          * either the local host initiated wireup or the local host
-//          * accepted the remote's wireup request.
-//          */
-//         (void) na_ucx_addr_free(cache->ctx->nacl, owner);
-
-//         return true;
-//     }
-
-//     /* Transmit deferred messages before saving the sender ID so that
-//      * a new transmission cannot slip out before the deferred ones.
-//      * New transmissions will find that the sender ID is nil and wait
-//      * for us to release the wiring lock.
-//      */
-//     HG_QUEUE_FOREACH (op, &cache->deferrals, info.tx.link) {
-//         const void *buf = op->info.tx.buf;
-//         na_size_t buf_size = op->info.tx.buf_size;
-//         uint64_t tag = op->info.tx.tag;
-//         if (hg_atomic_cas32(&op->status, op_s_deferred, op_s_underway)) {
-//             tagged_send(
-//                 cache->ctx, buf, buf_size, info.ep, info.sender_id, tag, op);
-//         } else if (hg_atomic_cas32(&op->status, op_s_canceled,
-//         op_s_complete)) {
-//             struct na_cb_info *cbinfo = &op->completion_data.callback_info;
-//             cbinfo->ret = NA_CANCELED;
-//             na_cb_completion_add(op->ctx.na, &op->completion_data);
-//         }
-//     }
-
-//     HG_QUEUE_INIT(&cache->deferrals);
-
-//     aseq = address_wire_write_begin(cache);
-//     atomic_store_explicit(&cache->ep, info.ep, memory_order_relaxed);
-//     atomic_store_explicit(
-//         &cache->sender_id, info.sender_id, memory_order_relaxed);
-//     address_wire_write_end(aseq);
-
-//     return true;
-// }
-
-// static na_return_t
-// na_ucx_msg_send(na_context_t *context, na_cb_t callback, void *arg,
-//     const void *buf, na_size_t buf_size, na_addr_t dest_addr,
-//     na_tag_t proto_tag, na_cb_type_t cb_type, na_op_id_t *op_id)
-// {
-//     na_ucx_context_t *cached_ctx, *const nuctx = context->plugin_context;
-//     sender_id_t sender_id;
-//     na_return_t ret;
-//     address_wire_t *cache = &dest_addr->wire_cache;
-//     ucp_ep_h ep;
-//     uint64_t tag;
-//     const na_tag_t NA_DEBUG_USED maxtag =
-//         (na_tag_t) MIN(NA_TAG_MAX, nuctx->msg.tagmax);
-
-//     assert(proto_tag <= maxtag);
-
-//     for (;;) {
-//         const address_wire_aseq_t aseq = address_wire_read_begin(cache);
-//         sender_id =
-//             atomic_load_explicit(&cache->sender_id, memory_order_relaxed);
-//         cached_ctx = atomic_load_explicit(&cache->ctx, memory_order_relaxed);
-//         /* XXX The endpoint mustn't be destroyed between the time we
-//          * load its pointer and the time we transmit on it, but the wireup
-//          * state machine isn't synchronized with transmission.
-//          *
-//          * Wireup probably should not
-//          * release an endpoint until an explicit wireup_stop() is performed.
-//          * I can introduce a state between "dead" and "reclaimed".
-//          *
-//          * Alternatively, defer releasing the endpoint until an "epoch" has
-//          * passed.
-//          */
-//         ep = atomic_load_explicit(&cache->ep, memory_order_relaxed);
-//         if (address_wire_read_end(aseq))
-//             break;
-//     }
-
-//     tag = proto_tag << nuctx->msg.tagshift;
-//     if (cb_type == NA_CB_SEND_EXPECTED)
-//         tag |= nuctx->exp.tag;
-//     else
-//         tag |= nuctx->unexp.tag;
-
-//     /* TBD Assert expected op_id->status */
-//     op_id->ctx.na = context;
-//     op_id->ctx.nu = nuctx;
-//     op_id->completion_data.callback_info.type = cb_type;
-//     op_id->completion_data.callback = callback;
-//     op_id->completion_data.callback_info.arg = arg;
-//     op_id->info.tx.buf = buf;
-//     op_id->info.tx.buf_size = buf_size;
-//     op_id->info.tx.tag = tag;
-
-//     /* Fast path: if the sender ID is established, and the cached context
-//      * matches the caller's context, then don't acquire the lock,
-//      * just send and return.
-//      */
-//     if (cached_ctx == context->plugin_context && sender_id != sender_id_nil)
-//     {
-//         op_id->status = op_s_underway;
-//         tagged_send(cached_ctx, buf, buf_size, ep, sender_id, tag, op_id);
-//         return NA_SUCCESS;
-//     }
-
-//     wiring_lock(&nuctx->wiring);
-
-//     /* Since we last checked, sender_id or ctx may have been set.  Check
-//      * once more.
-//      *
-//      * TBD handle cache->ctx that is equal to neither NULL nor
-//      * context->plugin_context.
-//      */
-//     if ((cached_ctx = cache->ctx) == NULL) {
-//         /* This thread can write to `cache->ctx` without conflicting
-//          * with any other thread: because the thread holds the lock,
-//          * no new wire-event callback will be established on `cache`.
-//          * Because `cache->ctx == NULL`, no wireup is underway, so no
-//          * wire-event callback is already established.
-//          */
-//         const address_wire_aseq_t aseq = address_wire_write_begin(cache);
-
-//         cache->ctx = cached_ctx = nuctx;
-
-//         addr_incref(cache->owner, "wireup");
-
-//         cache->wire_id = wireup_start(&cached_ctx->wiring,
-//             (ucp_address_t *) &cached_ctx->self->addr[0],
-//             cached_ctx->self->addrlen, (ucp_address_t *) &dest_addr->addr[0],
-//             dest_addr->addrlen, wire_event_callback, cache, dest_addr);
-
-//         address_wire_write_end(aseq);
-
-//         if (!wire_is_valid(cache->wire_id)) {
-//             NA_LOG_ERROR("could not start wireup, cache %p", (void *) cache);
-//             addr_decref(cache->owner, "wireup failure");
-//             ret = NA_NOMEM;
-//             goto release;
-//         }
-//     } else if ((sender_id = cache->sender_id) != sender_id_nil) {
-//         op_id->status = op_s_underway;
-//         tagged_send(cached_ctx, buf, buf_size, ep, sender_id, tag, op_id);
-//         ret = NA_SUCCESS;
-//         goto release;
-//     } else if (!wire_is_valid(cache->wire_id)) {
-
-//         const address_wire_aseq_t aseq = address_wire_write_begin(cache);
-
-//         addr_incref(cache->owner, "wireup");
-
-//         cache->wire_id = wireup_start(&cached_ctx->wiring,
-//             (ucp_address_t *) &cached_ctx->self->addr[0],
-//             cached_ctx->self->addrlen, (ucp_address_t *) &dest_addr->addr[0],
-//             dest_addr->addrlen, wire_event_callback, cache, dest_addr);
-
-//         address_wire_write_end(aseq);
-
-//         if (!wire_is_valid(cache->wire_id)) {
-//             NA_LOG_ERROR("could not start wireup, cache %p", (void *) cache);
-//             addr_decref(cache->owner, "wireup failure");
-//             ret = NA_NOMEM;
-//             goto release;
-//         }
-//     }
-
-//     hg_atomic_set32(&op_id->status, op_s_deferred);
-
-//     HG_QUEUE_PUSH_TAIL(&cache->deferrals, op_id, info.tx.link);
-
-//     ret = NA_SUCCESS;
-// release:
-//     // TBD put the following comments into the right place or delete them.
-//     //
-//     // if dest_addr has no wire ID, increase refcount on dest_addr by 1,
-//     //     start wireup with dest_addr as callback arg; set wire ID on
-//     //     dest_addr; enqueue op_id on dest_addr; in wireup callback,
-//     //     set sender ID on dest_addr, decrease refcount by 1, return false
-//     //     to stop callbacks.
-//     // if dest_addr has wire ID but no sender ID, enqueue op_id on dest_addr.
-//     // if dest_addr has sender ID, put it into the header and send the
-//     message. wiring_unlock(&nuctx->wiring); return ret;
-// }
-
-// /*---------------------------------------------------------------------------*/
-// static void
-// op_ref_reclaim(wiring_ref_t *ref)
-// {
-//     na_op_id_t *op = (na_op_id_t *) ((char *) ref - offsetof(na_op_id_t,
-//     ref));
-
-//     header_free(op->nucl->request_size, alignof(na_op_id_t), op);
-// }
-
-/*---------------------------------------------------------------------------*/
-
-// /*---------------------------------------------------------------------------*/
-// static void
-// send_callback(void *request, ucs_status_t status, void NA_UNUSED *user_data)
-// {
-//     na_op_id_t *op = request;
-//     na_ucx_context_t *nuctx = op->ctx.nu;
-//     struct na_cb_info *cbinfo = &op->completion_data.callback_info;
-//     const op_status_t expected_status =
-//         (status == UCS_ERR_CANCELED) ? op_s_canceled : op_s_underway;
-
-//     if (hg_atomic_get32(&op->status) != (hg_util_int32_t) expected_status) {
-//         NA_LOG_ERROR("op id %p: %s expected status %s, found %s", (void *)
-//         op,
-//             na_cb_type_string(op->completion_data.callback_info.type),
-//             op_status_string(expected_status), op_status_string(op->status));
-//     }
-//     hg_atomic_set32(&op->status, op_s_complete);
-
-//     if (status == UCS_OK)
-//         cbinfo->ret = NA_SUCCESS;
-//     else if (status == UCS_ERR_CANCELED)
-//         cbinfo->ret = NA_CANCELED;
-//     else
-//         cbinfo->ret = NA_PROTOCOL_ERROR;
-
-//     wiring_ref_put(&nuctx->wiring, &op->ref);
-
-//     na_cb_completion_add(op->ctx.na, &op->completion_data);
-// }
-
-// static na_mem_handle_t
-// resolve_mem_handle_locked(ucp_ep_h ep, na_mem_handle_t mh)
-// {
-//     na_mem_handle_header_t hdr;
-//     unpacked_rkey_t unpacked;
-//     packed_rkey_t *packed = &mh->handle.packed_remote;
-//     ucs_status_t status;
-
-//     if (hg_atomic_get32(&mh->kind) != na_ucx_mem_packed_remote)
-//         return mh;
-
-//     memcpy(&hdr, packed->buf, sizeof(hdr));
-
-//     status = ucp_ep_rkey_unpack(ep, packed->buf + sizeof(hdr),
-//     &unpacked.rkey); if (status != UCS_OK) {
-//         NA_LOG_ERROR("ucp_rkey_pack failed %s", ucs_status_string(status));
-//         return NULL;
-//     }
-
-//     // TBD convert from network endianness
-//     unpacked.remote_base_addr = hdr.base_addr;
-
-//     free(packed->buf);
-
-//     mh->handle.unpacked_remote = unpacked;
-//     hg_atomic_set32(&mh->kind, na_ucx_mem_unpacked_remote);
-
-//     return mh;
-// }
-
-// static na_mem_handle_t
-// resolve_mem_handle(ucp_ep_h ep, na_mem_handle_t mh)
-// {
-//     if (hg_atomic_get32(&mh->kind) != na_ucx_mem_packed_remote)
-//         return mh;
-
-//     hg_thread_mutex_lock(&mh->unpack_lock);
-//     mh = resolve_mem_handle_locked(ep, mh);
-//     hg_thread_mutex_unlock(&mh->unpack_lock);
-
-//     return mh;
-// }
-
-// static na_return_t
-// na_ucx_copy(na_context_t *ctx, na_cb_t callback, void *arg,
-//     na_mem_handle_t local_mh, na_offset_t local_offset,
-//     na_mem_handle_t remote_mh, na_offset_t remote_offset, na_size_t length,
-//     na_addr_t remote_addr, na_uint8_t NA_UNUSED remote_id, na_op_id_t *op,
-//     bool put)
-// {
-//     const ucp_request_param_t params = {
-//         .op_attr_mask = UCP_OP_ATTR_FIELD_CALLBACK |
-//         UCP_OP_ATTR_FIELD_REQUEST, .cb = {.send = send_callback}, .request =
-//         op};
-//     ucp_ep_h ep;
-//     na_ucx_context_t *nuctx;
-//     address_wire_t *cache = &remote_addr->wire_cache;
-//     ucs_status_ptr_t request;
-//     unpacked_rkey_t *unpacked = &remote_mh->handle.unpacked_remote;
-
-//     if (hg_atomic_get32(&local_mh->kind) != na_ucx_mem_local ||
-//         hg_atomic_get32(&remote_mh->kind) == na_ucx_mem_local) {
-//         return NA_INVALID_ARG;
-//     }
-
-//     for (;;) {
-//         const address_wire_aseq_t aseq = address_wire_read_begin(cache);
-//         nuctx = atomic_load_explicit(&cache->ctx, memory_order_relaxed);
-//         ep = atomic_load_explicit(&cache->ep, memory_order_relaxed);
-//         if (address_wire_read_end(aseq))
-//             break;
-//     }
-
-//     /* XXX Need to verify that `ep` cannot be NULL here. */
-
-//     assert(nuctx == ctx->plugin_context);
-
-//     if ((remote_mh = resolve_mem_handle(ep, remote_mh)) == NULL)
-//         return NA_PROTOCOL_ERROR;
-
-//     /* TBD: verify original status */
-//     hg_atomic_set32(&op->status, op_s_underway);
-//     op->ctx.na = ctx;
-//     op->ctx.nu = nuctx;
-//     op->completion_data.callback_info.type = put ? NA_CB_PUT : NA_CB_GET;
-//     op->completion_data.callback = callback;
-//     op->completion_data.callback_info.arg = arg;
-
-//     wiring_ref_get(&nuctx->wiring, &op->ref);
-
-//     if (put) {
-//         request = ucp_put_nbx(ep, local_mh->handle.local.buf + local_offset,
-//             length, unpacked->remote_base_addr + remote_offset,
-//             unpacked->rkey, &params);
-//     } else {
-//         request = ucp_get_nbx(ep, local_mh->handle.local.buf + local_offset,
-//             length, unpacked->remote_base_addr + remote_offset,
-//             unpacked->rkey, &params);
-//     }
-
-//     if (UCS_PTR_IS_ERR(request)) {
-//         NA_LOG_ERROR(
-//             "ucp_put_nbx: %s", ucs_status_string(UCS_PTR_STATUS(request)));
-//         wiring_ref_put(&nuctx->wiring, &op->ref);
-//         hg_atomic_set32(&op->status, op_s_complete);
-//         return NA_PROTOCOL_ERROR;
-//     } else if (request == UCS_OK) {
-//         // send was immediate: queue completion
-//         wiring_ref_put(&nuctx->wiring, &op->ref);
-//         hg_atomic_set32(&op->status, op_s_complete);
-//         op->completion_data.callback_info.ret = NA_SUCCESS;
-//         na_cb_completion_add(op->ctx.na, &op->completion_data);
-//     }
-
-//     return NA_SUCCESS;
-// }
 
 /********************/
 /* Plugin callbacks */
@@ -1451,7 +1796,7 @@ na_ucx_check_protocol(const char *protocol_name)
 {
     ucp_config_t *config = NULL;
     ucp_params_t params = {.field_mask = UCP_PARAM_FIELD_FEATURES,
-        .features = UCP_FEATURE_TAG | UCP_FEATURE_RMA};
+        .features = UCP_FEATURE_TAG | UCP_FEATURE_RMA | UCP_FEATURE_STREAM};
     ucp_context_h context = NULL;
     ucs_status_t status;
     na_bool_t accept = NA_FALSE;
@@ -1496,8 +1841,10 @@ na_ucx_initialize(
     ucp_lib_attr_t ucp_lib_attrs;
 #endif
     char *net_device = NULL;
-    struct sockaddr_storage *listener_sockaddr = NULL;
+    struct sockaddr_storage *listen_ss_addr = NULL,
+                            *ucp_listener_ss_addr = NULL;
     ucp_config_t *config;
+    na_bool_t no_wait = NA_FALSE;
     na_size_t unexpected_size_max = 0, expected_size_max = 0;
     ucs_thread_mode_t context_thread_mode = UCS_THREAD_MODE_SINGLE,
                       worker_thread_mode = UCS_THREAD_MODE_MULTI;
@@ -1505,6 +1852,12 @@ na_ucx_initialize(
     ucs_status_t status;
 
     if (na_info->na_init_info != NULL) {
+        /* Progress mode */
+        if (na_info->na_init_info->progress_mode & NA_NO_BLOCK)
+            no_wait = NA_TRUE;
+        /* Max contexts */
+        // if (na_info->na_init_info->max_contexts)
+        //     context_max = na_info->na_init_info->max_contexts;
         /* Sizes */
         if (na_info->na_init_info->max_unexpected_size)
             unexpected_size_max = na_info->na_init_info->max_unexpected_size;
@@ -1544,13 +1897,14 @@ na_ucx_initialize(
         (na_info->na_init_info && na_info->na_init_info->ip_subnet)
             ? na_info->na_init_info->ip_subnet
             : NULL,
-        &net_device, (listen) ? &listener_sockaddr : NULL);
+        &net_device, (listen) ? &listen_ss_addr : NULL);
     NA_CHECK_SUBSYS_NA_ERROR(
         cls, error, ret, "na_ucx_parse_hostname_info() failed");
 
-    na_ucx_class = calloc(1, sizeof(*na_ucx_class));
+    /* Create new UCX class */
+    na_ucx_class = na_ucx_class_alloc();
     NA_CHECK_SUBSYS_ERROR(cls, na_ucx_class == NULL, error, ret, NA_NOMEM,
-        "Could not allocate NA private data class");
+        "Could not allocate NA UCX class");
 
     /* Keep a copy of the protocol name */
     na_ucx_class->protocol_name = (na_info->protocol_name)
@@ -1558,6 +1912,9 @@ na_ucx_initialize(
                                       : strdup(NA_UCX_PROTOCOL_DEFAULT);
     NA_CHECK_SUBSYS_ERROR(cls, na_ucx_class->protocol_name == NULL, error, ret,
         NA_NOMEM, "Could not dup NA protocol name");
+
+    /* Set wait mode */
+    na_ucx_class->no_wait = no_wait;
 
     /* TODO may need to query UCX */
     na_ucx_class->unexpected_size_max =
@@ -1571,7 +1928,7 @@ na_ucx_initialize(
         cls, error, ret, "Could not initialize UCX config");
 
     /* Create UCP context and release config */
-    ret = na_ucp_context_create(config, context_thread_mode,
+    ret = na_ucp_context_create(config, no_wait, context_thread_mode,
         &na_ucx_class->ucp_context, &na_ucx_class->ucp_request_size);
     na_ucp_config_release(config);
     NA_CHECK_SUBSYS_NA_ERROR(cls, error, ret, "Could not create UCX context");
@@ -1584,47 +1941,32 @@ na_ucx_initialize(
     /* Create listener if we're listening */
     if (listen) {
         ret = na_ucp_listener_create(na_ucx_class->ucp_worker,
-            (const struct sockaddr *) listener_sockaddr,
-            sizeof(*listener_sockaddr), (void *) na_ucx_class,
-            &na_ucx_class->ucp_listener, &na_ucx_class->listener_addr);
+            (const struct sockaddr *) listen_ss_addr, sizeof(*listen_ss_addr),
+            (void *) na_ucx_class, &na_ucx_class->ucp_listener,
+            &ucp_listener_ss_addr);
         NA_CHECK_SUBSYS_NA_ERROR(
             cls, error, ret, "Could not create UCX listener");
+
+        /* No longer needed */
+        free(listen_ss_addr);
+        listen_ss_addr = NULL;
     }
 
     /* Create self address */
-    ret = na_ucx_addr_self_create(
-        (const struct sockaddr *) na_ucx_class->listener_addr,
-        sizeof(*na_ucx_class->listener_addr), &na_ucx_class->self_addr);
+    ret = na_ucx_addr_create((const struct sockaddr *) ucp_listener_ss_addr,
+        sizeof(*ucp_listener_ss_addr), &na_ucx_class->self_addr);
+    free(ucp_listener_ss_addr);
     NA_CHECK_SUBSYS_NA_ERROR(cls, error, ret, "Could not create self address");
-
-    /* Create connection hash table */
-
-    // rc = hg_thread_mutex_init(&nucl->addr_lock);
-    // NA_CHECK_SUBSYS_ERROR(cls, rc != HG_UTIL_SUCCESS, cleanup, ret, NA_NOMEM,
-    //     "Could not initialize address lock");
-
-    // nucl->addr_tbl = hg_hash_table_new(na_ucx_addr_hash, na_ucx_addr_equal);
-    // NA_CHECK_SUBSYS_ERROR(cls, nucl->addr_tbl == NULL, cleanup, ret,
-    // NA_NOMEM,
-    //     "Could not allocate address table");
 
     na_class->plugin_class = (void *) na_ucx_class;
 
     return NA_SUCCESS;
 
 error:
-    if (na_ucx_class) {
-        if (na_ucx_class->self_addr)
-            na_ucx_addr_self_destroy(na_ucx_class->self_addr);
-        if (na_ucx_class->ucp_listener)
-            na_ucp_listener_destroy(
-                na_ucx_class->ucp_listener, na_ucx_class->listener_addr);
-        if (na_ucx_class->ucp_worker)
-            na_ucp_worker_destroy(na_ucx_class->ucp_worker);
-        if (na_ucx_class->ucp_context)
-            na_ucp_context_destroy(na_ucx_class->ucp_context);
-        free(na_ucx_class);
-    }
+    free(listen_ss_addr);
+    if (na_ucx_class)
+        na_ucx_class_free(na_ucx_class);
+
     return ret;
 }
 
@@ -1642,22 +1984,7 @@ na_ucx_finalize(na_class_t *na_class)
         done, ret, NA_BUSY, "Contexts were not destroyed (%d remaining)",
         hg_atomic_get32(&na_ucx_class->ncontexts));
 
-    if (na_ucx_class->self_addr)
-        na_ucx_addr_self_destroy(na_ucx_class->self_addr);
-    if (na_ucx_class->ucp_listener)
-        na_ucp_listener_destroy(
-            na_ucx_class->ucp_listener, na_ucx_class->listener_addr);
-    if (na_ucx_class->ucp_worker)
-        na_ucp_worker_destroy(na_ucx_class->ucp_worker);
-    if (na_ucx_class->ucp_context)
-        na_ucp_context_destroy(na_ucx_class->ucp_context);
-
-    // if (nucl->addr_tbl != NULL)
-    //     hg_hash_table_free(nucl->addr_tbl);
-
-    // (void) hg_thread_mutex_destroy(&nucl->addr_lock);
-
-    free(na_ucx_class);
+    na_ucx_class_free(na_ucx_class);
     na_class->plugin_class = NULL;
 
 done:
@@ -1712,67 +2039,78 @@ done:
 static na_return_t
 na_ucx_addr_lookup(na_class_t *na_class, const char *name, na_addr_t *addr_p)
 {
-    //     na_ucx_addr_t *addr;
-    //     size_t buflen = 0, noctets;
-    //     int i = 0, nread, rc;
-    //     uint8_t *buf;
+    char host_string[NI_MAXHOST];
+    char serv_string[NI_MAXSERV];
+    struct addrinfo hints, *hostname_res = NULL;
+    struct na_ucx_class *na_ucx_class = NA_UCX_CLASS(na_class);
+    struct na_ucx_addr *na_ucx_addr = NULL;
+    na_return_t ret;
+    int rc;
 
-    //     noctets = (strlen(name) + 1) / 3;
+    /* Only support 'all' or same protocol */
+    NA_CHECK_SUBSYS_ERROR(fatal,
+        strncmp(name, "all", strlen("all")) &&
+            strncmp(name, na_ucx_class->protocol_name,
+                strlen(na_ucx_class->protocol_name)),
+        error, ret, NA_PROTOCOL_ERROR,
+        "Protocol not supported by this class (%s)",
+        na_ucx_class->protocol_name);
 
-    //     if (noctets < 1)
-    //         return 0;
+    /* Retrieve address */
+    rc = sscanf(name, "%*[^:]://%[^:]:%s", host_string, serv_string);
+    NA_CHECK_SUBSYS_ERROR(addr, rc != 2, error, ret, NA_PROTONOSUPPORT,
+        "Malformed address string");
 
-    //     if ((addr = malloc(sizeof(*addr) + noctets)) == NULL)
-    //         return NA_NOMEM;
+    NA_LOG_SUBSYS_DEBUG(addr, "Host %s, Serv %s", host_string, serv_string);
 
-    //     address_wire_init(&addr->wire_cache, addr, NULL);
+    /* Resolve address */
+    memset(&hints, 0, sizeof(struct addrinfo));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_NUMERICHOST | AI_NUMERICSERV;
+    hints.ai_protocol = 0;
+    rc = getaddrinfo(host_string, serv_string, &hints, &hostname_res);
+    NA_CHECK_ERROR(rc != 0, error, ret, NA_PROTOCOL_ERROR,
+        "getaddrinfo() failed (%s)", gai_strerror(rc));
 
-    //     addr->refcount = 1;
-    //     addr->addrlen = 0;
+    /* Lookup address from table */
+    na_ucx_addr = na_ucx_addr_map_lookup(&na_ucx_class->addr_map,
+        hostname_res->ai_addr, hostname_res->ai_addrlen);
 
-    //     buf = &addr->addr[0];
+    if (!na_ucx_addr) {
+        na_return_t na_ret;
 
-    //     rc = sscanf(&name[i], "%02" SCNx8 "%n", &buf[buflen], &nread);
-    //     if (rc == EOF) {
-    //         goto out;
-    //     } else if (rc != 1) {
-    //         NA_LOG_ERROR("parse error at '%s'", &name[i]);
-    //         free(addr);
-    //         return NA_INVALID_ARG;
-    //     }
+        NA_LOG_SUBSYS_DEBUG(addr,
+            "Address for %s was not found, attempting to insert it",
+            host_string);
 
-    //     for (buflen = 1, i = nread;
-    //          (rc = sscanf(&name[i], ":%02" SCNx8 "%n", &buf[buflen], &nread))
-    //          == 1; i += nread) {
-    //         buflen++;
-    //     }
+        /* Insert new entry and create new address if needed */
+        na_ret = na_ucx_addr_map_insert(&na_ucx_class->addr_map,
+            hostname_res->ai_addr, hostname_res->ai_addrlen, &na_ucx_addr);
+        freeaddrinfo(hostname_res);
+        NA_CHECK_SUBSYS_ERROR(addr, na_ret != NA_SUCCESS && na_ret != NA_EXIST,
+            error, ret, na_ret, "Could not insert new address");
+    } else {
+        freeaddrinfo(hostname_res);
+        NA_LOG_SUBSYS_DEBUG(addr, "Address for %s was found", host_string);
+    }
 
-    //     if (rc != EOF || name[i] != '\0') {
-    //         NA_LOG_ERROR("residual characters '%s'", &name[i]);
-    //         free(addr);
-    //         return NA_INVALID_ARG;
-    //     }
+    na_ucx_addr_ref_incr(na_ucx_addr);
 
-    //     assert(buflen == noctets);
-
-    // out:
-    //     addr->addrlen = buflen;
-    //     *addrp = na_ucx_addr_dedup(nacl, addr);
+    *addr_p = (na_addr_t) na_ucx_addr;
 
     return NA_SUCCESS;
+
+error:
+    return ret;
 }
 
 /*---------------------------------------------------------------------------*/
 static NA_INLINE na_return_t
-na_ucx_addr_free(na_class_t *nacl, na_addr_t _addr)
+na_ucx_addr_free(na_class_t NA_UNUSED *na_class, na_addr_t addr)
 {
-    return NA_SUCCESS;
-}
+    na_ucx_addr_ref_decr((struct na_ucx_addr *) addr);
 
-/*---------------------------------------------------------------------------*/
-static NA_INLINE na_return_t
-na_ucx_addr_set_remove(na_class_t NA_UNUSED *nacl, na_addr_t NA_UNUSED addr)
-{
     return NA_SUCCESS;
 }
 
@@ -1780,8 +2118,8 @@ na_ucx_addr_set_remove(na_class_t NA_UNUSED *nacl, na_addr_t NA_UNUSED addr)
 static NA_INLINE na_return_t
 na_ucx_addr_self(na_class_t *na_class, na_addr_t *addr_p)
 {
-    na_ucx_addr_ref_incr(&NA_UCX_CLASS(na_class)->self_addr);
-    *addr_p = NA_UCX_CLASS(na_class)->self_addr;
+    na_ucx_addr_ref_incr(NA_UCX_CLASS(na_class)->self_addr);
+    *addr_p = (na_addr_t) NA_UCX_CLASS(na_class)->self_addr;
 
     return NA_SUCCESS;
 }
@@ -1825,12 +2163,12 @@ na_ucx_addr_to_string(
     na_return_t ret;
     int rc;
 
-    NA_CHECK_SUBSYS_ERROR(addr, na_ucx_addr->sockaddr.addr == NULL, error, ret,
+    NA_CHECK_SUBSYS_ERROR(addr, na_ucx_addr->addr_key.addrlen == 0, error, ret,
         NA_OPNOTSUPPORTED, "Cannot convert address to string");
 
-    rc = getnameinfo(na_ucx_addr->sockaddr.addr, na_ucx_addr->sockaddr.addrlen,
-        host_string, sizeof(host_string), serv_string, sizeof(serv_string),
-        NI_NUMERICHOST | NI_NUMERICSERV);
+    rc = getnameinfo((const struct sockaddr *) &na_ucx_addr->ss_addr,
+        sizeof(na_ucx_addr->ss_addr), host_string, sizeof(host_string),
+        serv_string, sizeof(serv_string), NI_NUMERICHOST | NI_NUMERICSERV);
     NA_CHECK_SUBSYS_ERROR(addr, rc != 0, error, ret, NA_PROTOCOL_ERROR,
         "getnameinfo() failed (%s)", gai_strerror(rc));
 
@@ -1839,7 +2177,7 @@ na_ucx_addr_to_string(
     if (buf) {
         rc = snprintf(buf, buf_size, "%s://%s:%s", na_ucx_class->protocol_name,
             host_string, serv_string);
-        NA_CHECK_SUBSYS_ERROR(addr, rc < 0 || rc > buf_size, error, ret,
+        NA_CHECK_SUBSYS_ERROR(addr, rc < 0 || rc > (int) buf_size, error, ret,
             NA_OVERFLOW, "snprintf() failed or name truncated, rc: %d", rc);
 
         NA_LOG_SUBSYS_DEBUG(addr, "Converted UCX address (%p) to string (%s)",
@@ -1949,27 +2287,56 @@ na_ucx_msg_get_max_expected_size(const na_class_t *na_class)
 
 /*---------------------------------------------------------------------------*/
 static NA_INLINE na_tag_t
-na_ucx_msg_get_max_tag(const na_class_t *nacl)
+na_ucx_msg_get_max_tag(const na_class_t *na_class)
 {
-    // const na_ucx_class_t *nucl = na_ucx_class_const(nacl);
-    // const na_tag_t maxtag =
-    //     (na_tag_t) MIN(NA_TAG_MAX, nucl->context.msg.tagmax);
-
-    // assert(maxtag >= 3);
-
-    // return maxtag;
     return NA_UCX_MAX_TAG;
 }
 
 /*---------------------------------------------------------------------------*/
 static na_return_t
-na_ucx_msg_send_unexpected(na_class_t NA_UNUSED *nacl, na_context_t *context,
+na_ucx_msg_send_unexpected(na_class_t *na_class, na_context_t *context,
     na_cb_t callback, void *arg, const void *buf, na_size_t buf_size,
     void NA_UNUSED *plugin_data, na_addr_t dest_addr,
     na_uint8_t NA_UNUSED dest_id, na_tag_t tag, na_op_id_t *op_id)
 {
-    // return na_ucx_msg_send(context, callback, arg, buf, buf_size, dest_addr,
-    //     tag, NA_CB_SEND_UNEXPECTED, op_id);
+    struct na_ucx_addr *na_ucx_addr = (struct na_ucx_addr *) dest_addr;
+    struct na_ucx_op_id *na_ucx_op_id = (struct na_ucx_op_id *) op_id;
+    na_return_t ret;
+
+    /* Check op_id */
+    NA_CHECK_SUBSYS_ERROR(op, na_ucx_op_id == NULL, error, ret, NA_INVALID_ARG,
+        "Invalid operation ID");
+    NA_CHECK_SUBSYS_ERROR(op,
+        !(hg_atomic_get32(&na_ucx_op_id->status) & NA_UCX_OP_COMPLETED), error,
+        ret, NA_BUSY, "Attempting to use OP ID that was not completed");
+
+    NA_UCX_OP_RESET(na_ucx_op_id, context, NA_CB_SEND_UNEXPECTED, callback, arg,
+        na_ucx_addr);
+
+    /* TODO we assume that buf remains valid (safe because we pre-allocate
+     * buffers) */
+    na_ucx_op_id->info.msg = (struct na_ucx_msg_info){.buf.const_ptr = buf,
+        .buf_size = buf_size,
+        .actual_buf_size = buf_size,
+        .tag = tag};
+
+    if (!(hg_atomic_get32(na_ucx_addr->status) & NA_UCX_ADDR_RESOLVED)) {
+        ret = na_ucx_addr_resolve(NA_UCX_CLASS(na_class), na_ucx_addr);
+        NA_CHECK_NA_ERROR(error, ret, "Could not resolve address");
+
+        na_ucx_op_retry(NA_UCX_CLASS(na_class), na_ucx_op_id);
+    } else {
+        ret = na_ucp_msg_send(na_ucx_addr->ucp_ep, buf, buf_size,
+            na_ucp_tag_gen(tag, NA_TRUE, na_ucx_addr->remote_conn_id),
+            na_ucx_op_id);
+        NA_CHECK_NA_ERROR(error, ret, "Could not post unexpected msg");
+    }
+
+    return NA_SUCCESS;
+
+error:
+    NA_UCX_OP_RELEASE(na_ucx_op_id);
+    return ret;
 }
 
 /*---------------------------------------------------------------------------*/
@@ -1988,31 +2355,16 @@ na_ucx_msg_recv_unexpected(na_class_t *na_class, na_context_t *context,
         !(hg_atomic_get32(&na_ucx_op_id->status) & NA_UCX_OP_COMPLETED), error,
         ret, NA_BUSY, "Attempting to use OP ID that was not completed");
 
-    // NA_UCX_OP_ID_INIT(context, NA_CB_RECV_UNEXPECTED, callback, arg);
+    NA_UCX_OP_RESET_NO_ADDR(
+        na_ucx_op_id, context, NA_CB_RECV_UNEXPECTED, callback, arg);
 
-    na_ucx_op_id->context = context;
-    na_ucx_op_id->completion_data.callback_info.type = NA_CB_RECV_UNEXPECTED;
-    na_ucx_op_id->completion_data.callback = callback;
-    na_ucx_op_id->completion_data.callback_info.arg = arg;
-    na_ucx_op_id->addr = NULL;
-    hg_atomic_set32(&na_ucx_op_id->status, 0);
+    /* We assume buf remains valid (safe because we pre-allocate buffers) */
+    na_ucx_op_id->info.msg = (struct na_ucx_msg_info){
+        .buf.ptr = buf, .buf_size = buf_size, .actual_buf_size = 0, .tag = 0};
 
-    // /* We assume buf remains valid (safe because we pre-allocate buffers) */
-    // na_ofi_op_id->info.msg.buf.ptr = buf;
-    // na_ofi_op_id->info.msg.buf_size = buf_size;
-    // na_ofi_op_id->info.msg.actual_buf_size = 0;
-    // na_ofi_op_id->info.msg.fi_addr = FI_ADDR_UNSPEC;
-    // na_ofi_op_id->info.msg.fi_mr = plugin_data;
-    // na_ofi_op_id->info.msg.tag = 0;
-
-    ret = na_ucp_msg_recv(
-        NA_UCX_CLASS(na_class)->ucp_worker, buf, buf_size, 0, 0, na_ucx_op_id);
-
-    // na_ucx_context_t *nuctx = ctx->plugin_context;
-
-    // return na_ucx_msg_recv(ctx, callback, arg, buf, buf_size,
-    // nuctx->unexp.tag,
-    //     nuctx->msg.tagmask, NA_CB_RECV_UNEXPECTED, op_id);
+    ret = na_ucp_msg_recv(NA_UCX_CLASS(na_class)->ucp_worker, buf, buf_size,
+        NA_UCX_TAG_UNEXPECTED, NA_UCX_TAG_UNEXPECTED, na_ucx_op_id,
+        na_ucp_msg_recv_unexpected_cb);
 
     return NA_SUCCESS;
 
@@ -2022,31 +2374,78 @@ error:
 
 /*---------------------------------------------------------------------------*/
 static na_return_t
-na_ucx_msg_send_expected(na_class_t NA_UNUSED *nacl, na_context_t *ctx,
+na_ucx_msg_send_expected(na_class_t *na_class, na_context_t *context,
     na_cb_t callback, void *arg, const void *buf, na_size_t buf_size,
     void NA_UNUSED *plugin_data, na_addr_t dest_addr,
     na_uint8_t NA_UNUSED dest_id, na_tag_t tag, na_op_id_t *op_id)
 {
-    // return na_ucx_msg_send(ctx, callback, arg, buf, buf_size, dest_addr, tag,
-    //     NA_CB_SEND_EXPECTED, op_id);
+    struct na_ucx_addr *na_ucx_addr = (struct na_ucx_addr *) dest_addr;
+    struct na_ucx_op_id *na_ucx_op_id = (struct na_ucx_op_id *) op_id;
+    na_return_t ret;
+
+    /* Check op_id */
+    NA_CHECK_SUBSYS_ERROR(op, na_ucx_op_id == NULL, error, ret, NA_INVALID_ARG,
+        "Invalid operation ID");
+    NA_CHECK_SUBSYS_ERROR(op,
+        !(hg_atomic_get32(&na_ucx_op_id->status) & NA_UCX_OP_COMPLETED), error,
+        ret, NA_BUSY, "Attempting to use OP ID that was not completed");
+
+    NA_UCX_OP_RESET(
+        na_ucx_op_id, context, NA_CB_SEND_EXPECTED, callback, arg, na_ucx_addr);
+
+    /* TODO we assume that buf remains valid (safe because we pre-allocate
+     * buffers) */
+    na_ucx_op_id->info.msg = (struct na_ucx_msg_info){.buf.const_ptr = buf,
+        .buf_size = buf_size,
+        .actual_buf_size = buf_size,
+        .tag = tag};
+
+    if (!na_ucx_addr->ucp_ep)
+        na_ucx_addr_resolve(NA_UCX_CLASS(na_class), na_ucx_addr);
+
+    ret = na_ucp_msg_send(na_ucx_addr->ucp_ep, buf, buf_size,
+        na_ucp_tag_gen(tag, NA_FALSE, na_ucx_addr->remote_conn_id),
+        na_ucx_op_id);
+    NA_CHECK_NA_ERROR(error, ret, "Could not post expected msg send");
+
+    return NA_SUCCESS;
+
+error:
+    return ret;
 }
 
 /*---------------------------------------------------------------------------*/
 static na_return_t
-na_ucx_msg_recv_expected(na_class_t NA_UNUSED *nacl, na_context_t *ctx,
+na_ucx_msg_recv_expected(na_class_t *na_class, na_context_t *context,
     na_cb_t callback, void *arg, void *buf, na_size_t buf_size,
-    void NA_UNUSED *plugin_data, na_addr_t NA_UNUSED source_addr,
-    na_uint8_t NA_UNUSED source_id, na_tag_t proto_tag, na_op_id_t *op_id)
+    void NA_UNUSED *plugin_data, na_addr_t source_addr,
+    na_uint8_t NA_UNUSED source_id, na_tag_t tag, na_op_id_t *op_id)
 {
-    // na_ucx_context_t *nuctx = ctx->plugin_context;
-    // const na_tag_t NA_DEBUG_USED maxtag =
-    //     (na_tag_t) MIN(NA_TAG_MAX, nuctx->msg.tagmax);
+    struct na_ucx_addr *na_ucx_addr = (struct na_ucx_addr *) source_addr;
+    struct na_ucx_op_id *na_ucx_op_id = (struct na_ucx_op_id *) op_id;
+    na_return_t ret;
 
-    // assert(proto_tag <= maxtag);
+    /* Check op_id */
+    NA_CHECK_SUBSYS_ERROR(op, na_ucx_op_id == NULL, error, ret, NA_INVALID_ARG,
+        "Invalid operation ID");
+    NA_CHECK_SUBSYS_ERROR(op,
+        !(hg_atomic_get32(&na_ucx_op_id->status) & NA_UCX_OP_COMPLETED), error,
+        ret, NA_BUSY, "Attempting to use OP ID that was not completed");
 
-    // return na_ucx_msg_recv(ctx, callback, arg, buf, buf_size,
-    //     nuctx->exp.tag | (proto_tag << nuctx->msg.tagshift), UINT64_MAX,
-    //     NA_CB_RECV_EXPECTED, op_id);
+    NA_UCX_OP_RESET(
+        na_ucx_op_id, context, NA_CB_RECV_EXPECTED, callback, arg, na_ucx_addr);
+
+    /* We assume buf remains valid (safe because we pre-allocate buffers) */
+    na_ucx_op_id->info.msg = (struct na_ucx_msg_info){
+        .buf.ptr = buf, .buf_size = buf_size, .actual_buf_size = 0, .tag = tag};
+
+    ret = na_ucp_msg_recv(NA_UCX_CLASS(na_class)->ucp_worker, buf, buf_size,
+        tag, NA_UCX_TAG_MASK, na_ucx_op_id, na_ucp_msg_recv_expected_cb);
+
+    return NA_SUCCESS;
+
+error:
+    return ret;
 }
 
 /*---------------------------------------------------------------------------*/
@@ -2261,17 +2660,47 @@ na_ucx_get(na_class_t NA_UNUSED *nacl, na_context_t *ctx, na_cb_t callback,
 }
 
 /*---------------------------------------------------------------------------*/
-static NA_INLINE int
-na_ucx_poll_get_fd(na_class_t *nacl, na_context_t *ctx)
+static int
+na_ucx_poll_get_fd(na_class_t *na_class, na_context_t NA_UNUSED *context)
 {
-    return NA_PROTOCOL_ERROR;
+    struct na_ucx_class *na_ucx_class = NA_UCX_CLASS(na_class);
+    ucs_status_t status;
+    int fd;
+
+    if (na_ucx_class->no_wait)
+        return -1;
+
+    status = ucp_worker_get_efd(na_ucx_class->ucp_worker, &fd);
+    NA_CHECK_SUBSYS_ERROR(poll, status != UCS_OK, error, fd, -1,
+        "ucp_worker_get_efd() failed (%s)", ucs_status_string(status));
+
+    return fd;
+
+error:
+    return -1;
 }
 
 /*---------------------------------------------------------------------------*/
 static NA_INLINE na_bool_t
-na_ucx_poll_try_wait(na_class_t *nacl, na_context_t *ctx)
+na_ucx_poll_try_wait(na_class_t *na_class, na_context_t NA_UNUSED *context)
 {
-    return NA_PROTOCOL_ERROR;
+    struct na_ucx_class *na_ucx_class = NA_UCX_CLASS(na_class);
+    ucs_status_t status;
+
+    if (na_ucx_class->no_wait)
+        return NA_FALSE;
+
+    status = ucp_worker_arm(na_ucx_class->ucp_worker);
+    if (status == UCS_ERR_BUSY) {
+        /* Events have already arrived */
+        return NA_FALSE;
+    } else if (status != UCS_OK) {
+        NA_LOG_SUBSYS_ERROR(
+            poll, "ucp_worker_arm() failed (%s)", ucs_status_string(status));
+        return NA_FALSE;
+    }
+
+    return NA_TRUE;
 }
 
 /*---------------------------------------------------------------------------*/
@@ -2298,7 +2727,8 @@ na_ucx_progress(na_class_t *na_class, na_context_t NA_UNUSED *context,
 
 /*---------------------------------------------------------------------------*/
 static na_return_t
-na_ucx_cancel(na_class_t NA_UNUSED *nacl, na_context_t *context, na_op_id_t *op)
+na_ucx_cancel(
+    na_class_t NA_UNUSED *na_class, na_context_t *context, na_op_id_t *op)
 {
     // na_ucx_context_t *ctx = context->plugin_context;
 
