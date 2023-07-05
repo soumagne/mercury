@@ -5657,6 +5657,9 @@ na_ofi_cq_read(struct fid_cq *cq, struct fi_cq_tagged_entry cq_events[],
     if (rc > 0) { /* events available */
         *actual_count = (size_t) rc;
         *err_avail = false;
+
+        /* TEST: Force provider to progress */
+        (void) fi_cq_read(cq, NULL, 0);
     } else if (rc == -FI_EAGAIN) { /* no event available */
         *actual_count = 0;
         *err_avail = false;
