@@ -53,6 +53,10 @@ hg_test_bulk_forward(hg_handle_t handle, hg_addr_t addr, hg_id_t rpc_id,
 static hg_return_t
 hg_test_bulk_forward_cb(const struct hg_cb_info *callback_info);
 
+static hg_return_t
+hg_test_bulk_create_multi(hg_class_t *hg_class, size_t count,
+    size_t rotate_count);
+
 /*******************/
 /* Local Variables */
 /*******************/
@@ -101,7 +105,7 @@ hg_test_bulk_create(hg_class_t *hg_class, size_t segment_count,
     HG_TEST_CHECK_HG_ERROR(
         error, ret, "HG_Bulk_create() failed (%s)", HG_Error_to_string(ret));
 
-    *bulk_info_p = (struct hg_test_bulk_info){.buf_count = segment_count,
+    *bulk_info_p = (struct hg_test_bulk_info) {.buf_count = segment_count,
         .buf_ptrs = buf_ptrs,
         .buf_sizes = buf_sizes,
         .bulk_handle = bulk_handle};
@@ -116,6 +120,86 @@ error:
     }
     if (buf_sizes != NULL)
         free(buf_sizes);
+
+    return ret;
+}
+
+/*---------------------------------------------------------------------------*/
+static hg_return_t
+hg_test_bulk_create_multi(
+    hg_class_t *hg_class, size_t count, size_t rotate_count)
+{
+    void *buf = NULL;
+    hg_bulk_t *bulk_handles = NULL;
+    size_t i, r;
+    hg_return_t ret;
+
+    buf = malloc(count * sizeof(int) * rotate_count);
+    HG_TEST_CHECK_ERROR(
+        buf == NULL, error, ret, HG_NOMEM, "Could not allocate buf_ptrs");
+
+    for (i = 0; i < count; i++) {
+        size_t j;
+
+        for (j = 0; j < rotate_count; j++)
+            ((int *) buf)[i * rotate_count + j] = (int) (i * rotate_count + j);
+    }
+
+    for (i = 0; i < count; i++) {
+        HG_TEST_LOG_DEBUG("Segment %zu: ", i);
+        for (size_t j = 0; j < rotate_count; j++)
+            HG_TEST_LOG_DEBUG(" %d", ((int *) buf)[i * rotate_count + j]);
+        HG_TEST_LOG_DEBUG("\n");
+    }
+
+    bulk_handles = (hg_bulk_t *) malloc(count * sizeof(*bulk_handles));
+    HG_TEST_CHECK_ERROR(bulk_handles == NULL, error, ret, HG_NOMEM,
+        "Could not allocate bulk_handles");
+
+    for (r = 0; r < count; r++) {
+        HG_TEST_LOG_DEBUG("Creating bulk handles rotate=%zu", r);
+        for (i = 0; i < count; i++) {
+            void *buf_ptrs[1] = {
+                ((char *) buf) + i * sizeof(int) * rotate_count};
+            hg_size_t buf_sizes[1] = {sizeof(int)};
+
+            ret = HG_Bulk_create(hg_class, 1, buf_ptrs, buf_sizes,
+                HG_BULK_READ_ONLY, &bulk_handles[i]);
+            HG_TEST_CHECK_HG_ERROR(error, ret,
+                "HG_Bulk_create() failed for segment %zu (%s)", i,
+                HG_Error_to_string(ret));
+            HG_TEST_LOG_DEBUG("Created bulk handle %zu", i);
+        }
+
+        for (i = 0; i < count; i++) {
+            if (bulk_handles[i] != HG_BULK_NULL) {
+                ret = HG_Bulk_free(bulk_handles[i]);
+                HG_TEST_CHECK_HG_ERROR(error, ret,
+                    "HG_Bulk_free() failed for segment %zu (%s)", i,
+                    HG_Error_to_string(ret));
+                bulk_handles[i] = HG_BULK_NULL;
+            }
+        }
+    }
+    free(bulk_handles);
+    free(buf);
+
+    return HG_SUCCESS;
+
+error:
+    if (bulk_handles != NULL) {
+        for (i = 0; i < count; i++) {
+            if (bulk_handles[i] != HG_BULK_NULL) {
+                ret = HG_Bulk_free(bulk_handles[i]);
+                HG_TEST_CHECK_HG_ERROR(error, ret,
+                    "HG_Bulk_free() failed for segment %zu (%s)", i,
+                    HG_Error_to_string(ret));
+            }
+        }
+        free(bulk_handles);
+    }
+
+    free(buf);
 
     return ret;
 }
@@ -287,6 +371,10 @@ main(int argc, char *argv[])
     hg_ret = hg_test_bulk_destroy(&bulk_info);
     HG_TEST_CHECK_HG_ERROR(error, hg_ret, "hg_test_bulk_destroy() failed (%s)",
         HG_Error_to_string(hg_ret));
+
+    hg_ret = hg_test_bulk_create_multi(info.hg_class, 1024, 16);
+    HG_TEST_CHECK_HG_ERROR(error, hg_ret,
+        "hg_test_bulk_create_multi() failed (%s)", HG_Error_to_string(hg_ret));
 
     /**************************************************************************
      * Contiguous RPC bulk tests.
