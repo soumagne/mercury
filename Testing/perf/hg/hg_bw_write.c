@@ -66,6 +66,9 @@ hg_perf_run(const struct hg_test_info *hg_test_info,
                     &info->local_bulk_handles[j]);
                 HG_TEST_CHECK_HG_ERROR(error, ret,
                     "HG_Bulk_create() failed (%s)", HG_Error_to_string(ret));
+                ret = HG_Bulk_bind(info->local_bulk_handles[j], info->context);
+                HG_TEST_CHECK_HG_ERROR(error, ret, "HG_Bulk_bind() failed (%s)",
+                    HG_Error_to_string(ret));
             }
             if (i >= skip) {
                 hg_time_get_current(&t4);
@@ -152,7 +155,7 @@ main(int argc, char *argv[])
 
     /* Bulk RPC with different sizes */
     for (size = MAX(1, info->buf_size_min); size <= info->buf_size_max;
-         size *= 2) {
+        size *= 2) {
         hg_ret = hg_perf_run(hg_test_info, info, size,
             (size > HG_PERF_LARGE_SIZE) ? HG_PERF_LAT_SKIP_LARGE
                                         : HG_PERF_LAT_SKIP_SMALL);

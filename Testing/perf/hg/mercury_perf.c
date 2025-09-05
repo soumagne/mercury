@@ -65,7 +65,7 @@ hg_perf_class_cleanup(struct hg_perf_class_info *info);
 
 static hg_return_t
 hg_perf_bulk_buf_alloc(struct hg_perf_class_info *info, uint8_t bulk_flags,
-    bool init_data, bool bulk_create);
+    bool init_data, bool bulk_create, bool bind);
 
 static void
 hg_perf_bulk_buf_free(struct hg_perf_class_info *info);
@@ -470,7 +470,7 @@ hg_perf_class_cleanup(struct hg_perf_class_info *info)
 /*---------------------------------------------------------------------------*/
 static hg_return_t
 hg_perf_bulk_buf_alloc(struct hg_perf_class_info *info, uint8_t bulk_flags,
-    bool init_data, bool bulk_create)
+    bool init_data, bool bulk_create, bool bind)
 {
     size_t page_size = (size_t) hg_mem_get_page_size();
     hg_return_t ret;
@@ -503,6 +503,11 @@ hg_perf_bulk_buf_alloc(struct hg_perf_class_info *info, uint8_t bulk_flags,
                 &alloc_size, bulk_flags, &info->local_bulk_handles[i]);
             HG_TEST_CHECK_HG_ERROR(error, ret, "HG_Bulk_create() failed (%s)",
                 HG_Error_to_string(ret));
+            if (bind) {
+                ret = HG_Bulk_bind(info->local_bulk_handles[i], info->context);
+                HG_TEST_CHECK_HG_ERROR(error, ret, "HG_Bulk_bind() failed (%s)",
+                    HG_Error_to_string(ret));
+            }
         }
     }
 
@@ -699,7 +704,7 @@ hg_perf_bulk_buf_init(const struct hg_test_info *hg_test_info,
     size_t i;
 
     ret = hg_perf_bulk_buf_alloc(info, bulk_flags, bulk_op == HG_BULK_PULL,
-        !hg_test_info->na_test_info.force_register);
+        !hg_test_info->na_test_info.force_register, true);
     HG_TEST_CHECK_HG_ERROR(error, ret, "hg_perf_bulk_buf_alloc() failed (%s)",
         HG_Error_to_string(ret));
 
@@ -1364,7 +1369,7 @@ hg_perf_bulk_init_cb(hg_handle_t handle)
         info->buf_size_max = bulk_info.size_max;
 
         ret = hg_perf_bulk_buf_alloc(
-            info, bulk_flags, bulk_info.bulk_op == HG_BULK_PUSH, true);
+            info, bulk_flags, bulk_info.bulk_op == HG_BULK_PUSH, true, false);
         HG_TEST_CHECK_HG_ERROR(error_free, ret,
             "hg_perf_bulk_buf_alloc() failed (%s)", HG_Error_to_string(ret));
 
@@ -1443,8 +1448,8 @@ hg_perf_bulk_common(hg_handle_t handle, hg_bulk_op_t op)
 
     /* Post bulk push */
     for (i = 0; i < info->bulk_count; i++) {
-        ret = HG_Bulk_transfer(info->context, hg_perf_bulk_transfer_cb, handle,
-            op, hg_info->addr, remote_bulk, i * info->buf_size_max,
+        ret = HG_Bulk_bind_transfer(info->context, hg_perf_bulk_transfer_cb,
+            handle, op, remote_bulk, i * info->buf_size_max,
             info->local_bulk_handles[bulk_info.handle_id],
             i * info->buf_size_max, bulk_info.size, HG_OP_ID_IGNORE);
         HG_TEST_CHECK_HG_ERROR(error_free, ret,
