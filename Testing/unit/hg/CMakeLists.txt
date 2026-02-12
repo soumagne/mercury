@@ -221,6 +221,7 @@ build_mercury_test(bulk)
 
 build_mercury_test(lookup)
 build_mercury_test(proc)
+build_mercury_test(bulk_mem)
 
 build_mercury_test(kill)
 
