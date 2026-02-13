@@ -59,7 +59,8 @@ main(int argc, char *argv[])
     HG_TEST_CHECK_ERROR_NORET(buf == NULL, cleanup, "calloc(buf) failed");
 
 again:
-    HG_TEST_LOG_WARNING("Registering %d buffers", (int)(buf_count - start_index));
+    HG_TEST_LOG_WARNING(
+        "Registering %d buffers", (int) (buf_count - start_index));
     for (i = start_index; i < buf_count; i++) {
         buf_ptrs[i] = (char *) buf + i * buf_size;
 
@@ -88,6 +89,7 @@ cleanup:
 
 error:
     if (hg_ret == HG_NOMEM) {
+        start_index = i;
         HG_TEST_LOG_WARNING("HG_Bulk_create() failed with HG_NOMEM, retrying "
                             "from idx=%d after freeing space...",
             (int) start_index);
@@ -99,7 +101,6 @@ error:
                 bulk_handles[i] = HG_BULK_NULL;
             }
         }
-        start_index = i;
         goto again;
     } else {
         HG_TEST_LOG_ERROR("Cannot retry HG_Bulk_create() after failure");
