@@ -41,6 +41,7 @@ main(int argc, char *argv[])
     void **buf_ptrs = NULL;
     void *buf = NULL;
     hg_bulk_t *bulk_handles = NULL;
+    int retry = 0;
 
     /* Initialize the interface */
     hg_ret = hg_unit_init(argc, argv, false, &info);
@@ -68,6 +69,7 @@ again:
             HG_BULK_READWRITE, &bulk_handles[i]);
         HG_TEST_CHECK_HG_ERROR(error, hg_ret, "HG_Bulk_create() failed (%s)",
             HG_Error_to_string(hg_ret));
+        retry = 0; // Reset retry count after a successful create
     }
 
 cleanup:
@@ -88,7 +90,7 @@ cleanup:
     return EXIT_SUCCESS;
 
 error:
-    if (hg_ret == HG_NOMEM) {
+    if (hg_ret == HG_NOMEM && retry < 2) {
         start_index = i;
         HG_TEST_LOG_WARNING("HG_Bulk_create() failed with HG_NOMEM, retrying "
                             "from idx=%d after freeing space...",
@@ -101,6 +103,7 @@ error:
                 bulk_handles[i] = HG_BULK_NULL;
             }
         }
+        retry++;
         goto again;
     } else {
         HG_TEST_LOG_ERROR("Cannot retry HG_Bulk_create() after failure");
